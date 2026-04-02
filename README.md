@@ -1,5 +1,8 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## What is this?
+This app scrapes videos from a list in the StoryBlocks website. Used for Youtube automation. 
+
 ## Getting Started
 
 First, run the development server:

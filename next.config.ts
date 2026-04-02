@@ -1,7 +1,8 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  // Allow longer API route execution for Puppeteer operations
+  serverExternalPackages: ["puppeteer"],
 };
 
 export default nextConfig;
