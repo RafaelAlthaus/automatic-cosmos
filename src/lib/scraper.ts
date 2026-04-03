@@ -446,6 +446,31 @@ async function cleanupDownloadArtifacts(targetPath?: string) {
   await rm(targetPath, { recursive: true, force: true }).catch(() => {});
 }
 
+async function waitForSearchCards(page: Page, timeoutMs: number) {
+  return page
+    .waitForFunction(() => {
+      const textOf = (el: Element) => (el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const candidateLinks = Array.from(document.querySelectorAll("a[href*='/video/stock/']")).filter((el) => {
+        if (el.closest("header") || el.closest("nav") || el.closest("footer")) return false;
+        const href = el.getAttribute("href") || "";
+        const label = `${el.getAttribute("aria-label") || ""} ${textOf(el)}`.trim();
+        return href.includes("/video/stock/") && (label.length > 0 || !!el.querySelector("img, video, picture"));
+      });
+
+      if (candidateLinks.length > 0) return true;
+
+      const pageText = textOf(document.body);
+      return (
+        pageText.includes("no results") ||
+        pageText.includes("0 results") ||
+        pageText.includes("did not match any results") ||
+        pageText.includes("we couldn't find")
+      );
+    }, { timeout: timeoutMs })
+    .then(() => true)
+    .catch(() => false);
+}
+
 async function scrapeSingleSearchUrl(
   browser: Browser,
   url: string,
@@ -463,16 +488,34 @@ async function scrapeSingleSearchUrl(
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
     await delay(OPERATION_DELAY_MS);
 
-    await page.waitForSelector('[class*="image-link"], [data-testid*="video"], a[href*="/video/"]', {
-      timeout: 15000,
-    });
+    let cardsReady = await waitForSearchCards(page, 15000);
+    if (!cardsReady) {
+      await page.reload({ waitUntil: "networkidle2", timeout: 30000 }).catch(() => null);
+      await delay(OPERATION_DELAY_MS);
+      await page.evaluate(() => window.scrollTo({ top: document.body.scrollHeight * 0.25, behavior: "instant" })).catch(() => null);
+      await delay(350);
+      cardsReady = await waitForSearchCards(page, 8000);
+    }
+
+    if (!cardsReady) {
+      throw new Error("Could not find Storyblocks result cards on the search page");
+    }
 
     const videoCards = await page.evaluate(() => {
-      let cards = Array.from(document.querySelectorAll("a.image-link"));
-      if (cards.length === 0) cards = Array.from(document.querySelectorAll('a[href*="/video/stock/"]'));
-      if (cards.length === 0) cards = Array.from(document.querySelectorAll('[data-testid*="video"] a'));
+      const textOf = (el: Element) => (el.textContent || "").replace(/\s+/g, " ").trim();
+      const candidateCards = Array.from(document.querySelectorAll("a[href*='/video/stock/']")).filter((el) => {
+        if (el.closest("header") || el.closest("nav") || el.closest("footer")) return false;
+        const href = el.getAttribute("href") || "";
+        const label = `${el.getAttribute("aria-label") || ""} ${textOf(el)}`.trim();
+        return href.includes("/video/stock/") && (label.length > 0 || !!el.querySelector("img, video, picture"));
+      });
 
-      return cards.slice(0, 6).map((card) => {
+      const dedupedCards = candidateCards.filter((card, index, list) => {
+        const href = card.getAttribute("href") || "";
+        return href && list.findIndex((other) => (other.getAttribute("href") || "") === href) === index;
+      });
+
+      return dedupedCards.slice(0, 6).map((card) => {
         const anchor = card.closest("a") || card;
         const videoEl = card.querySelector("video");
         const sourceEl = videoEl?.querySelector("source");
@@ -500,7 +543,7 @@ async function scrapeSingleSearchUrl(
     });
 
     const videos: VideoInfo[] = [...videoCards];
-    const cardElements = await page.$$("a.image-link, a[href*='/video/stock/']");
+    const cardElements = await page.$$("a[href*='/video/stock/']");
     const needsHover = videos.some((video) => !video.previewVideoUrl);
 
     if (needsHover) {
