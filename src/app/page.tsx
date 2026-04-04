@@ -31,6 +31,18 @@ export default function Home() {
     return `${safeBase}.mp4`;
   }, []);
 
+  const getFilenameFromContentDisposition = useCallback((contentDisposition: string | null) => {
+    if (!contentDisposition) return "";
+
+    const utf8Match = contentDisposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+    if (utf8Match?.[1]) {
+      return decodeURIComponent(utf8Match[1]).replace(/['"]/g, "").trim();
+    }
+
+    const basicMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/i);
+    return basicMatch?.[1]?.replace(/['"]/g, "").trim() || "";
+  }, []);
+
   const triggerBrowserDownload = useCallback(async (href: string, suggestedName?: string) => {
     const link = document.createElement("a");
     link.href = href;
@@ -46,6 +58,7 @@ export default function Home() {
     async (href: string, suggestedName: string) => {
       const response = await fetch(href);
       const contentType = response.headers.get("content-type") || "";
+      const responseFilename = getFilenameFromContentDisposition(response.headers.get("content-disposition"));
 
       if (!response.ok || !contentType.includes("video/")) {
         let message = `Download failed with HTTP ${response.status}`;
@@ -61,12 +74,12 @@ export default function Home() {
       const blob = await response.blob();
       const blobUrl = URL.createObjectURL(blob);
       try {
-        await triggerBrowserDownload(blobUrl, suggestedName);
+        await triggerBrowserDownload(blobUrl, responseFilename || suggestedName);
       } finally {
         URL.revokeObjectURL(blobUrl);
       }
     },
-    [triggerBrowserDownload]
+    [getFilenameFromContentDisposition, triggerBrowserDownload]
   );
 
   const downloadVideoFromDetail = useCallback(
@@ -84,12 +97,13 @@ export default function Home() {
         body: JSON.stringify({ detailUrl, cookies: parsedCookies }),
       });
       const contentType = response.headers.get("content-type") || "";
+      const responseFilename = getFilenameFromContentDisposition(response.headers.get("content-disposition"));
 
-      if (contentType.includes("video/mp4")) {
+      if (contentType.includes("video/")) {
         const blob = await response.blob();
         const url = URL.createObjectURL(blob);
         try {
-          await triggerBrowserDownload(url, toDownloadFilename(title));
+          await triggerBrowserDownload(url, responseFilename || toDownloadFilename(title));
         } finally {
           URL.revokeObjectURL(url);
         }
@@ -105,7 +119,7 @@ export default function Home() {
 
       throw new Error(data?.error || `Download failed with HTTP ${response.status}`);
     },
-    [cookiesJson, downloadViaAppRoute, toDownloadFilename, triggerBrowserDownload]
+    [cookiesJson, downloadViaAppRoute, getFilenameFromContentDisposition, toDownloadFilename, triggerBrowserDownload]
   );
 
   const startScraping = useCallback(async () => {
@@ -642,7 +656,7 @@ export default function Home() {
                             {downloading === video.detailUrl ? (
                               <div className="bg-zinc-900/90 rounded-full px-4 py-2 text-sm">Downloading...</div>
                             ) : (
-                              <div className="bg-blue-600/90 rounded-full px-4 py-2 text-sm font-medium">Click to Download HD MP4</div>
+                              <div className="bg-blue-600/90 rounded-full px-4 py-2 text-sm font-medium">Click to Download HD Video</div>
                             )}
                           </div>
                         </div>
@@ -658,7 +672,7 @@ export default function Home() {
                     </div>
                   ))}
                 </div>
-                <p className="text-center text-xs text-zinc-600">Click videos to download HD MP4. Use Next/Previous to navigate between URL groups.</p>
+                <p className="text-center text-xs text-zinc-600">Click videos to download the best HD format available. Use Next/Previous to navigate between URL groups.</p>
               </div>
             )}
           </section>

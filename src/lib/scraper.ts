@@ -17,6 +17,8 @@ const OPERATION_DELAY_MS = 500;
 const CAPTURE_TIMEOUT_MS = 15000;
 const DOWNLOAD_TIMEOUT_MS = 25000;
 const DOWNLOAD_POLL_MS = 250;
+const DOWNLOAD_ATTEMPT_TIMEOUT_MS = 60000;
+const MAX_DOWNLOAD_ATTEMPTS = 2;
 const SCRAPE_CONCURRENCY = 6;
 export const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 export const DOWNLOAD_CACHE_ROOT = path.join(os.tmpdir(), "automatic-cosmos-storyblocks");
@@ -29,6 +31,20 @@ function normalizeStoryblocksUrl(url: string) {
 
 function sanitizeFilename(filename: string) {
   return filename.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim() || "video.mp4";
+}
+
+function parseFilenameFromContentDisposition(contentDisposition: string) {
+  const utf8Match = contentDisposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    return sanitizeFilename(decodeURIComponent(utf8Match[1]).replace(/['"]/g, "").trim());
+  }
+
+  const basicMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/i);
+  if (basicMatch?.[1]) {
+    return sanitizeFilename(basicMatch[1].replace(/['"]/g, "").trim());
+  }
+
+  return "";
 }
 
 function isPreviewUrl(url: string) {
@@ -446,6 +462,28 @@ async function cleanupDownloadArtifacts(targetPath?: string) {
   await rm(targetPath, { recursive: true, force: true }).catch(() => {});
 }
 
+type DownloadLookupResult = {
+  downloadUrl: string;
+  filename?: string;
+  loggedIn?: boolean;
+  error?: string;
+  localFilePath?: string;
+};
+
+function isRetryableDownloadError(error?: string) {
+  if (!error) return false;
+
+  const message = error.toLowerCase();
+  return (
+    message.includes("timed out after 60 seconds") ||
+    message.includes("could not find the download button") ||
+    message.includes("could not confirm the hd download") ||
+    message.includes("no supported hd format under") ||
+    message.includes("failed to switch away from") ||
+    message.includes("no hd video url or file was captured")
+  );
+}
+
 async function waitForSearchCards(page: Page, timeoutMs: number) {
   return page
     .waitForFunction(() => {
@@ -672,11 +710,11 @@ export async function scrapeSearchUrls(
   return { results, errors };
 }
 
-export async function getDownloadUrl(
+async function getDownloadUrlOnce(
   detailUrl: string,
   cookies: StoryblocksCookie[],
   sharedBrowser?: Browser
-): Promise<{ downloadUrl: string; filename?: string; loggedIn?: boolean; error?: string; localFilePath?: string }> {
+): Promise<DownloadLookupResult> {
   const ownsBrowser = !sharedBrowser;
   const browser =
     sharedBrowser ??
@@ -719,38 +757,49 @@ export async function getDownloadUrl(
     const existingFiles = new Set(await readdir(downloadDir).catch(() => []));
 
     let captureResolved = false;
-    let resolveCapture!: (url: string) => void;
-    const capturePromise = new Promise<string>((resolve) => {
-      resolveCapture = (url: string) => {
-        if (captureResolved || !isLikelyMediaDownloadUrl(url)) return;
+    let resolveCapture!: (capture: { url: string; filename?: string }) => void;
+    const capturePromise = new Promise<{ url: string; filename?: string }>((resolve) => {
+      resolveCapture = (capture) => {
+        const filename = capture.filename || "";
+        const filenameLooksVideo = /\.(mp4|mov)(\?|$)/i.test(filename);
+        if (captureResolved || (!isLikelyMediaDownloadUrl(capture.url) && !filenameLooksVideo)) return;
         captureResolved = true;
-        resolve(url);
+        resolve({
+          url: capture.url,
+          filename: filename ? sanitizeFilename(filename) : undefined,
+        });
       };
     });
 
     requestHandler = (request) => {
-      resolveCapture(request.url());
+      resolveCapture({ url: request.url() });
     };
 
     responseHandler = async (response) => {
       const responseUrl = response.url();
       const location = response.headers()["location"] ?? "";
-      resolveCapture(responseUrl);
-      resolveCapture(location);
-
       const contentDisposition = response.headers()["content-disposition"] ?? "";
-      if (contentDisposition.toLowerCase().includes("attachment") && isLikelyMediaDownloadUrl(responseUrl)) {
-        resolveCapture(responseUrl);
+      const contentType = response.headers()["content-type"] ?? "";
+      const filename = parseFilenameFromContentDisposition(contentDisposition);
+      const looksLikeVideoResponse =
+        contentDisposition.toLowerCase().includes("attachment") ||
+        contentType.toLowerCase().startsWith("video/");
+
+      if (looksLikeVideoResponse) {
+        resolveCapture({ url: responseUrl, filename });
+        if (location) resolveCapture({ url: location, filename });
+      } else {
+        resolveCapture({ url: responseUrl });
+        if (location) resolveCapture({ url: location });
       }
 
-      const contentType = response.headers()["content-type"] ?? "";
       if (!contentType.includes("json")) return;
 
       try {
         const body = await response.json();
         const candidates = extractCandidateUrls(body);
         for (const candidate of candidates) {
-          resolveCapture(candidate);
+          resolveCapture({ url: candidate });
         }
       } catch {
         // Ignore JSON parsing issues from non-download responses.
@@ -846,7 +895,7 @@ export async function getDownloadUrl(
     }
 
     const outcome = await Promise.race([
-      capturePromise.then((url) => ({ kind: "url" as const, url })),
+      capturePromise.then((capture) => ({ kind: "url" as const, ...capture })),
       waitForDownloadedFile(downloadDir, existingFiles, DOWNLOAD_TIMEOUT_MS).then((file) =>
         file ? { kind: "file" as const, ...file } : { kind: "file-timeout" as const }
       ),
@@ -870,6 +919,7 @@ export async function getDownloadUrl(
       }
       return {
         downloadUrl: outcome.url,
+        filename: outcome.filename,
         loggedIn: true,
       };
     }
@@ -900,7 +950,7 @@ export async function getDownloadUrl(
       loggedIn: accountState?.loggedInLikely ?? true,
       error: accountState?.explicitLoggedOut
         ? "Not logged in — cookies may be expired or invalid"
-        : "Download flow ran, but no HD MP4 URL or file was captured",
+        : "Download flow ran, but no HD video URL or file was captured",
     };
   } finally {
     if (page && requestHandler) {
@@ -923,4 +973,53 @@ export async function getDownloadUrl(
       await browser.close();
     }
   }
+}
+
+export async function getDownloadUrl(
+  detailUrl: string,
+  cookies: StoryblocksCookie[],
+  sharedBrowser?: Browser
+): Promise<DownloadLookupResult> {
+  const attempts = sharedBrowser ? 1 : MAX_DOWNLOAD_ATTEMPTS;
+  let lastResult: DownloadLookupResult | undefined;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let result: DownloadLookupResult;
+
+    try {
+      result = sharedBrowser
+        ? await getDownloadUrlOnce(detailUrl, cookies, sharedBrowser)
+        : await Promise.race<DownloadLookupResult>([
+            getDownloadUrlOnce(detailUrl, cookies),
+            delay(DOWNLOAD_ATTEMPT_TIMEOUT_MS).then(() => ({
+              downloadUrl: "",
+              error: `Download attempt timed out after ${Math.round(DOWNLOAD_ATTEMPT_TIMEOUT_MS / 1000)} seconds`,
+            })),
+          ]);
+    } catch (err) {
+      result = {
+        downloadUrl: "",
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+
+    lastResult = result;
+
+    if (!result.error) {
+      return result;
+    }
+
+    if (attempt >= attempts || !isRetryableDownloadError(result.error)) {
+      return result;
+    }
+
+    await delay(1000);
+  }
+
+  return (
+    lastResult ?? {
+      downloadUrl: "",
+      error: "Download failed",
+    }
+  );
 }

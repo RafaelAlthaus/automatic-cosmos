@@ -5,6 +5,22 @@ import type { StoryblocksCookie } from "@/lib/types";
 
 export const maxDuration = 120; // 2 minutes max
 
+function getFilenameFromContentDisposition(contentDisposition: string) {
+  const utf8Match = contentDisposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    return decodeURIComponent(utf8Match[1]).replace(/['"]/g, "").trim();
+  }
+
+  const basicMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/i);
+  return basicMatch?.[1]?.replace(/['"]/g, "").trim() || "";
+}
+
+function getVideoContentType(filename: string, upstreamType?: string | null) {
+  if (upstreamType?.toLowerCase().startsWith("video/")) return upstreamType;
+  if (filename.toLowerCase().endsWith(".mov")) return "video/quicktime";
+  return "video/mp4";
+}
+
 export async function POST(req: Request) {
   const { detailUrl, cookies }: { detailUrl: string; cookies: StoryblocksCookie[] } = await req.json();
 
@@ -36,7 +52,7 @@ export async function POST(req: Request) {
 
       return new Response(fileBuffer, {
         headers: {
-          "Content-Type": "video/mp4",
+          "Content-Type": getVideoContentType(filename),
           "Content-Disposition": `attachment; filename="${filename}"`,
           "Content-Length": String(fileBuffer.byteLength),
         },
@@ -65,8 +81,7 @@ export async function POST(req: Request) {
     }
 
     const contentDisposition = fileResponse.headers.get("content-disposition") ?? "";
-    const cdMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
-    const cdFilename = cdMatch?.[1]?.replace(/['"]/g, "").trim();
+    const cdFilename = getFilenameFromContentDisposition(contentDisposition);
     const urlFilename = (() => {
       try {
         const parts = new URL(downloadUrl).pathname.split("/");
@@ -79,7 +94,7 @@ export async function POST(req: Request) {
 
     return new Response(fileResponse.body, {
       headers: {
-        "Content-Type": "video/mp4",
+        "Content-Type": getVideoContentType(filename, fileResponse.headers.get("content-type")),
         "Content-Disposition": `attachment; filename="${filename}"`,
         ...(fileResponse.headers.get("content-length")
           ? { "Content-Length": fileResponse.headers.get("content-length")! }

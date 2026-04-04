@@ -10,6 +10,26 @@ function sanitizeFilename(filename: string) {
   return filename.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim() || "video.mp4";
 }
 
+function getFilenameFromContentDisposition(contentDisposition: string) {
+  const utf8Match = contentDisposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    return sanitizeFilename(decodeURIComponent(utf8Match[1]).replace(/['"]/g, "").trim());
+  }
+
+  const basicMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/i);
+  if (basicMatch?.[1]) {
+    return sanitizeFilename(basicMatch[1].replace(/['"]/g, "").trim());
+  }
+
+  return "";
+}
+
+function getVideoContentType(filename: string, upstreamType?: string | null) {
+  if (upstreamType?.toLowerCase().startsWith("video/")) return upstreamType;
+  if (filename.toLowerCase().endsWith(".mov")) return "video/quicktime";
+  return "video/mp4";
+}
+
 function isWithinDownloadCache(targetPath: string) {
   const resolvedTarget = path.resolve(targetPath);
   const resolvedRoot = path.resolve(DOWNLOAD_CACHE_ROOT);
@@ -50,7 +70,7 @@ export async function GET(req: Request) {
     const filename = sanitizeFilename(filenameParam || path.basename(resolvedLocalPath));
     return new Response(Readable.toWeb(stream) as ReadableStream, {
       headers: {
-        "Content-Type": "video/mp4",
+        "Content-Type": getVideoContentType(filename),
         "Content-Disposition": `attachment; filename="${filename}"`,
         "Content-Length": String(fileStat.size),
       },
@@ -75,11 +95,24 @@ export async function GET(req: Request) {
       return Response.json({ error: "File exceeds 100 MB limit" }, { status: 413 });
     }
 
-    const safeTitle = sanitizeFilename(title.slice(0, 80)).replace(/\.mp4$/i, "");
+    const contentDisposition = fileResponse.headers.get("content-disposition") ?? "";
+    const upstreamFilename =
+      getFilenameFromContentDisposition(contentDisposition) ||
+      (() => {
+        try {
+          const parts = new URL(url!).pathname.split("/");
+          return sanitizeFilename(parts[parts.length - 1] || "");
+        } catch {
+          return "";
+        }
+      })();
+    const safeFilename =
+      upstreamFilename ||
+      `${sanitizeFilename(title.slice(0, 80)).replace(/\.(mp4|mov)$/i, "")}.mp4`;
     return new Response(fileResponse.body, {
       headers: {
-        "Content-Type": "video/mp4",
-        "Content-Disposition": `attachment; filename="${safeTitle}.mp4"`,
+        "Content-Type": getVideoContentType(safeFilename, fileResponse.headers.get("content-type")),
+        "Content-Disposition": `attachment; filename="${safeFilename}"`,
         ...(fileResponse.headers.get("content-length")
           ? { "Content-Length": fileResponse.headers.get("content-length")! }
           : {}),
