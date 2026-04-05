@@ -1,16 +1,62 @@
 "use client";
 
 import { useState, useRef, useCallback } from "react";
-import type { SearchResult, ScrapeError, ProgressEvent, StoryblocksCookie, VideoInfo } from "@/lib/types";
+import type {
+  DownloadBatchEvent,
+  DownloadBatchInputVideo,
+  DownloadProfileName,
+  DownloadBatchSummary,
+  ProgressEvent,
+  ReplacementCandidate,
+  ScrapeError,
+  SearchResult,
+  StoryblocksCookie,
+  VideoInfo,
+} from "@/lib/types";
 
 type VideoSlot = { video: VideoInfo; originalIndex: number };
+type DownloadError = {
+  videoUrl: string;
+  searchUrl: string;
+  error: string;
+  title?: string;
+  suggestedFilename?: string;
+  resultIndex?: number;
+  slotIndex?: number;
+  replacedWith?: ReplacementCandidate;
+  originalError?: string;
+  kind: "failure" | "replaced";
+};
+type DownloadCheckpoint = {
+  signature: string;
+  nextIndex: number;
+  total: number;
+  updatedAt: number;
+};
+
+const DOWNLOAD_CHECKPOINT_KEY = "automatic-cosmos.download-checkpoint.v1";
+const CLIENT_DOWNLOAD_CONCURRENCY: Record<DownloadProfileName, number> = {
+  fast: 10,
+  balanced: 6,
+  safe: 1,
+  serial: 1,
+  teste: 1,
+};
+
+const createBatchSignature = (videos: DownloadBatchInputVideo[], profile: DownloadProfileName) =>
+  videos
+    .map(
+      (video) =>
+        `${video.searchUrl}|${video.resultIndex}|${video.slotIndex}|${video.detailUrl}|${video.suggestedFilename || ""}`
+    )
+    .join("::") + `::profile=${profile}`;
 
 export default function Home() {
   const [cookiesJson, setCookiesJson] = useState("");
   const [urls, setUrls] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [errors, setErrors] = useState<ScrapeError[]>([]);
-  const [downloadErrors, setDownloadErrors] = useState<{ videoUrl: string; searchUrl: string; error: string }[]>([]);
+  const [downloadErrors, setDownloadErrors] = useState<DownloadError[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [progress, setProgress] = useState<string[]>([]);
@@ -24,23 +70,19 @@ export default function Home() {
   const [autoSelectedSlots, setAutoSelectedSlots] = useState<VideoSlot[][]>([]);
   const [autoSelectIndex, setAutoSelectIndex] = useState(0);
   const [downloadingAll, setDownloadingAll] = useState(false);
+  const [downloadProfile, setDownloadProfile] = useState<DownloadProfileName>("balanced");
+  const [stopOnCriticalError, setStopOnCriticalError] = useState(true);
+  const [reScrapingIndex, setReScrapingIndex] = useState<number | null>(null);
   const [downloadAllProgress, setDownloadAllProgress] = useState<{ done: number; total: number } | null>(null);
+  const [batchSummary, setBatchSummary] = useState<DownloadBatchSummary | null>(null);
+  const [orderAudit, setOrderAudit] = useState<{ lastSequence: number; violations: number }>({
+    lastSequence: 0,
+    violations: 0,
+  });
 
   const toDownloadFilename = useCallback((title: string) => {
     const safeBase = title.slice(0, 50).replace(/[^a-zA-Z0-9]/g, "_") || "video";
     return `${safeBase}.mp4`;
-  }, []);
-
-  const getFilenameFromContentDisposition = useCallback((contentDisposition: string | null) => {
-    if (!contentDisposition) return "";
-
-    const utf8Match = contentDisposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
-    if (utf8Match?.[1]) {
-      return decodeURIComponent(utf8Match[1]).replace(/['"]/g, "").trim();
-    }
-
-    const basicMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/i);
-    return basicMatch?.[1]?.replace(/['"]/g, "").trim() || "";
   }, []);
 
   const triggerBrowserDownload = useCallback(async (href: string, suggestedName?: string) => {
@@ -51,39 +93,25 @@ export default function Home() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    await new Promise((resolve) => setTimeout(resolve, 650));
-  }, []);
+    const postClickDelayMs =
+      downloadProfile === "safe" ? 650 :
+      downloadProfile === "teste" ? 500 :
+      downloadProfile === "balanced" ? 220 :
+      downloadProfile === "serial" ? 40 :
+      140;
+    await new Promise((resolve) => setTimeout(resolve, postClickDelayMs));
+  }, [downloadProfile]);
 
   const downloadViaAppRoute = useCallback(
     async (href: string, suggestedName: string) => {
-      const response = await fetch(href);
-      const contentType = response.headers.get("content-type") || "";
-      const responseFilename = getFilenameFromContentDisposition(response.headers.get("content-disposition"));
-
-      if (!response.ok || !contentType.includes("video/")) {
-        let message = `Download failed with HTTP ${response.status}`;
-        try {
-          const payload = await response.json();
-          if (payload?.error) message = payload.error;
-        } catch {
-          // Keep fallback message.
-        }
-        throw new Error(message);
-      }
-
-      const blob = await response.blob();
-      const blobUrl = URL.createObjectURL(blob);
-      try {
-        await triggerBrowserDownload(blobUrl, responseFilename || suggestedName);
-      } finally {
-        URL.revokeObjectURL(blobUrl);
-      }
+      // Prefer direct browser download to avoid buffering files into JS memory.
+      await triggerBrowserDownload(href, suggestedName);
     },
-    [getFilenameFromContentDisposition, triggerBrowserDownload]
+    [triggerBrowserDownload]
   );
 
   const downloadVideoFromDetail = useCallback(
-    async (detailUrl: string, title: string) => {
+    async (detailUrl: string, title: string, forcedFilename?: string) => {
       let parsedCookies: StoryblocksCookie[];
       try {
         parsedCookies = JSON.parse(cookiesJson);
@@ -94,16 +122,15 @@ export default function Home() {
       const response = await fetch("/api/download", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ detailUrl, cookies: parsedCookies }),
+        body: JSON.stringify({ detailUrl, cookies: parsedCookies, profile: downloadProfile }),
       });
       const contentType = response.headers.get("content-type") || "";
-      const responseFilename = getFilenameFromContentDisposition(response.headers.get("content-disposition"));
 
-      if (contentType.includes("video/")) {
+      if (contentType.includes("video/mp4")) {
         const blob = await response.blob();
         const url = URL.createObjectURL(blob);
         try {
-          await triggerBrowserDownload(url, responseFilename || toDownloadFilename(title));
+          await triggerBrowserDownload(url, forcedFilename || toDownloadFilename(title));
         } finally {
           URL.revokeObjectURL(url);
         }
@@ -112,14 +139,17 @@ export default function Home() {
 
       const data = await response.json().catch(() => null);
       if (data?.downloadUrl) {
-        const proxyHref = `/api/proxy-file?url=${encodeURIComponent(data.downloadUrl)}&title=${encodeURIComponent(title)}`;
-        await downloadViaAppRoute(proxyHref, toDownloadFilename(title));
+        const suggested = forcedFilename || toDownloadFilename(title);
+        const proxyHref = `/api/proxy-file?url=${encodeURIComponent(data.downloadUrl)}&title=${encodeURIComponent(
+          title
+        )}&filename=${encodeURIComponent(suggested)}`;
+        await downloadViaAppRoute(proxyHref, suggested);
         return;
       }
 
       throw new Error(data?.error || `Download failed with HTTP ${response.status}`);
     },
-    [cookiesJson, downloadViaAppRoute, getFilenameFromContentDisposition, toDownloadFilename, triggerBrowserDownload]
+    [cookiesJson, downloadViaAppRoute, downloadProfile, toDownloadFilename, triggerBrowserDownload]
   );
 
   const startScraping = useCallback(async () => {
@@ -147,6 +177,8 @@ export default function Home() {
     setAutoSelectedSlots([]);
     setAutoSelectIndex(0);
     setDownloadAllProgress(null);
+    setBatchSummary(null);
+    setOrderAudit({ lastSequence: 0, violations: 0 });
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -200,13 +232,75 @@ export default function Home() {
     }
   }, [cookiesJson, urls, autoSelect, videosPerLink]);
 
+  const reScrapeSingleUrl = useCallback(async (resultIndex: number) => {
+    const searchUrl = results[resultIndex]?.searchUrl;
+    if (!searchUrl) return;
+
+    let parsedCookies: StoryblocksCookie[];
+    try {
+      parsedCookies = JSON.parse(cookiesJson);
+    } catch {
+      return;
+    }
+
+    setReScrapingIndex(resultIndex);
+    try {
+      const response = await fetch("/api/scrape", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ urls: [searchUrl], cookies: parsedCookies }),
+      });
+      if (!response.ok || !response.body) return;
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let newResult: SearchResult | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const event: ProgressEvent = JSON.parse(line);
+            if (event.type === "result" && event.data && "searchUrl" in event.data) {
+              newResult = event.data as SearchResult;
+            }
+          } catch {}
+        }
+      }
+
+      if (newResult && newResult.videos.length > 0) {
+        setResults((prev) => {
+          const updated = [...prev];
+          updated[resultIndex] = newResult!;
+          return updated;
+        });
+        const newSlots: VideoSlot[] = newResult.videos
+          .slice(0, videosPerLink)
+          .map((video, i) => ({ video, originalIndex: i }));
+        setAutoSelectedSlots((prev) => {
+          const updated = [...prev];
+          updated[resultIndex] = newSlots;
+          return updated;
+        });
+      }
+    } finally {
+      setReScrapingIndex(null);
+    }
+  }, [results, cookiesJson, videosPerLink]);
+
   const handleDownload = useCallback(
     async (detailUrl: string, searchUrl: string, title: string) => {
       setDownloading(detailUrl);
       try {
         await downloadVideoFromDetail(detailUrl, title);
       } catch (err) {
-        setDownloadErrors((prev) => [...prev, { videoUrl: detailUrl, searchUrl, error: err instanceof Error ? err.message : String(err) }]);
+        setDownloadErrors((prev) => [...prev, { videoUrl: detailUrl, searchUrl, error: err instanceof Error ? err.message : String(err), kind: "failure" }]);
       } finally {
         setDownloading(null);
       }
@@ -252,15 +346,28 @@ export default function Home() {
 
   const handleDownloadAll = useCallback(async () => {
     const workingSlots = autoSelectedSlots.map((slots) => slots.map((slot) => ({ ...slot })));
-    const allVideos = workingSlots.flatMap((slots, i) =>
-      slots.map((slot, slotIndex) => ({
-        detailUrl: slot.video.detailUrl,
-        title: slot.video.title,
-        searchUrl: results[i]?.searchUrl ?? "",
-        resultIndex: i,
-        slotIndex,
-      }))
-    );
+    let sequenceCounter = 0;
+    const allVideos = workingSlots.flatMap((slots, i) => {
+      const usedIndexes = new Set(slots.map((s) => s.originalIndex));
+      const allResultVideos = results[i]?.videos ?? [];
+      return slots.map((slot, slotIndex) => {
+        sequenceCounter += 1;
+        const suggestedFilename = `${String(sequenceCounter).padStart(4, "0")}.mp4`;
+        const replacements: ReplacementCandidate[] = allResultVideos
+          .map((v, idx) => ({ detailUrl: v.detailUrl, title: v.title, originalIndex: idx }))
+          .filter((r) => !usedIndexes.has(r.originalIndex) && r.originalIndex !== slot.originalIndex);
+        return {
+          detailUrl: slot.video.detailUrl,
+          title: slot.video.title,
+          searchUrl: results[i]?.searchUrl ?? "",
+          resultIndex: i,
+          slotIndex,
+          sequenceIndex: sequenceCounter,
+          suggestedFilename,
+          replacements,
+        };
+      });
+    });
     if (allVideos.length === 0) return;
 
     let parsedCookies: StoryblocksCookie[];
@@ -271,20 +378,72 @@ export default function Home() {
       return;
     }
 
+    const signature = createBatchSignature(allVideos, downloadProfile);
+    let resumeIndex = 0;
+    try {
+      const raw = localStorage.getItem(DOWNLOAD_CHECKPOINT_KEY);
+      if (raw) {
+        const checkpoint = JSON.parse(raw) as DownloadCheckpoint;
+        const isMatchingRun =
+          checkpoint?.signature === signature &&
+          checkpoint.total === allVideos.length &&
+          checkpoint.nextIndex > 0 &&
+          checkpoint.nextIndex < allVideos.length;
+        if (isMatchingRun) {
+          const shouldResume = window.confirm(
+            `Resume previous batch from item ${checkpoint.nextIndex + 1} of ${checkpoint.total}?`
+          );
+          if (shouldResume) {
+            resumeIndex = checkpoint.nextIndex;
+          } else {
+            localStorage.removeItem(DOWNLOAD_CHECKPOINT_KEY);
+          }
+        }
+      }
+    } catch {
+      localStorage.removeItem(DOWNLOAD_CHECKPOINT_KEY);
+    }
+
+    const persistCheckpoint = (nextIndex: number) => {
+      const checkpoint: DownloadCheckpoint = {
+        signature,
+        total: allVideos.length,
+        nextIndex,
+        updatedAt: Date.now(),
+      };
+      localStorage.setItem(DOWNLOAD_CHECKPOINT_KEY, JSON.stringify(checkpoint));
+    };
+
+    persistCheckpoint(resumeIndex);
+
+    const queuedVideos = allVideos.slice(resumeIndex);
+    if (queuedVideos.length === 0) {
+      setDownloadAllProgress({ done: allVideos.length, total: allVideos.length });
+      localStorage.removeItem(DOWNLOAD_CHECKPOINT_KEY);
+      return;
+    }
+
     setDownloadingAll(true);
-    setDownloadAllProgress({ done: 0, total: allVideos.length });
+    setDownloadAllProgress({ done: resumeIndex, total: allVideos.length });
+    setBatchSummary(null);
+    setOrderAudit({ lastSequence: 0, violations: 0 });
 
     let batchResp: Response;
     try {
       batchResp = await fetch("/api/download-batch", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ videos: allVideos, cookies: parsedCookies }),
+        body: JSON.stringify({
+          videos: queuedVideos,
+          cookies: parsedCookies,
+          profile: downloadProfile,
+          stopOnCriticalError,
+        }),
       });
     } catch (err) {
       setDownloadErrors((prev) => [
         ...prev,
-        { videoUrl: "", searchUrl: "", error: `Batch fetch failed: ${err instanceof Error ? err.message : String(err)}` },
+        { videoUrl: "", searchUrl: "", error: `Batch fetch failed: ${err instanceof Error ? err.message : String(err)}`, kind: "failure" as const },
       ]);
       setDownloadingAll(false);
       setDownloadAllProgress(null);
@@ -298,6 +457,7 @@ export default function Home() {
         {
           videoUrl: "",
           searchUrl: "",
+          kind: "failure" as const,
           error:
             payload?.error ||
             `Batch download failed with HTTP ${batchResp.status}${batchResp.body ? "" : " (empty response body)"}`,
@@ -308,56 +468,71 @@ export default function Home() {
       return;
     }
 
-    // Stream NDJSON — download each file directly from CloudFront as its URL arrives
+    // Stream NDJSON and preserve deterministic order visibility.
     const reader = batchResp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    let done = 0;
-    const shouldAutoReplace = (message: string) =>
-      message.includes("100 MB") || message.includes("No supported HD format under 100 MB");
-
+    let done = resumeIndex;
+    let expectedSequence = 1;
+    let localOrderViolations = 0;
+    const activeDownloadTasks = new Set<Promise<void>>();
+    const maxConcurrentDownloads = CLIENT_DOWNLOAD_CONCURRENCY[downloadProfile];
+    const filenameBySlot = new Map<string, string>();
+    for (const video of allVideos) {
+      filenameBySlot.set(`${video.resultIndex}:${video.slotIndex}`, video.suggestedFilename || "video.mp4");
+    }
     const syncWorkingSlots = () => {
       setAutoSelectedSlots(workingSlots.map((slots) => slots.map((slot) => ({ ...slot }))));
     };
 
-    const autoReplaceAndDownload = async (resultIndex: number, slotIndex: number, initialError: string) => {
-      let lastError = initialError;
-
-      while (true) {
-        const replacement = getNextReplacementSlot(workingSlots, resultIndex, slotIndex);
-        if (!replacement) {
-          setDownloadErrors((prev) => [
-            ...prev,
-            {
-              videoUrl: workingSlots[resultIndex]?.[slotIndex]?.video.detailUrl ?? "",
-              searchUrl: results[resultIndex]?.searchUrl ?? "",
-              error: lastError,
-            },
-          ]);
-          return;
+    const applyServerReplacement = (event: DownloadBatchEvent) => {
+      if (
+        event.replacedWith &&
+        typeof event.resultIndex === "number" &&
+        typeof event.slotIndex === "number"
+      ) {
+        const allResultVideos = results[event.resultIndex]?.videos ?? [];
+        const replacementVideo = allResultVideos[event.replacedWith.originalIndex];
+        if (replacementVideo && workingSlots[event.resultIndex]?.[event.slotIndex]) {
+          workingSlots[event.resultIndex][event.slotIndex] = {
+            video: replacementVideo,
+            originalIndex: event.replacedWith.originalIndex,
+          };
+          syncWorkingSlots();
         }
 
-        workingSlots[resultIndex][slotIndex] = replacement;
-        syncWorkingSlots();
-
-        try {
-          await downloadVideoFromDetail(replacement.video.detailUrl, replacement.video.title);
-          return;
-        } catch (err) {
-          lastError = err instanceof Error ? err.message : String(err);
-          if (!shouldAutoReplace(lastError)) {
-            setDownloadErrors((prev) => [
-              ...prev,
-              {
-                videoUrl: replacement.video.detailUrl,
-                searchUrl: results[resultIndex]?.searchUrl ?? "",
-                error: lastError,
-              },
-            ]);
-            return;
-          }
-        }
+        setDownloadErrors((prev) => [
+          ...prev,
+          {
+            videoUrl: event.detailUrl || "",
+            searchUrl: event.searchUrl || "",
+            error: event.originalError || "Auto-replaced (original exceeded size limit)",
+            title: event.title,
+            suggestedFilename: event.suggestedFilename,
+            resultIndex: event.resultIndex,
+            slotIndex: event.slotIndex,
+            replacedWith: event.replacedWith,
+            originalError: event.originalError,
+            kind: "replaced",
+          },
+        ]);
       }
+    };
+
+    const markItemCompleted = () => {
+      done += 1;
+      setDownloadAllProgress({ done, total: allVideos.length });
+      persistCheckpoint(done);
+    };
+
+    const enqueueDownloadTask = async (task: () => Promise<void>) => {
+      while (activeDownloadTasks.size >= maxConcurrentDownloads) {
+        await Promise.race(activeDownloadTasks);
+      }
+      const wrappedTask = task().finally(() => {
+        activeDownloadTasks.delete(wrappedTask);
+      });
+      activeDownloadTasks.add(wrappedTask);
     };
 
     try {
@@ -370,52 +545,125 @@ export default function Home() {
         for (const line of lines) {
           if (!line.trim()) continue;
           try {
-            const result: {
-              detailUrl: string;
-              title: string;
-              searchUrl: string;
-              resultIndex?: number;
-              slotIndex?: number;
-              downloadUrl?: string;
-              proxyUrl?: string;
-              error?: string;
-            } = JSON.parse(line);
-            try {
-              if (result.proxyUrl) {
-                await downloadViaAppRoute(result.proxyUrl, toDownloadFilename(result.title));
-              } else if (result.downloadUrl) {
-                const proxyHref = `/api/proxy-file?url=${encodeURIComponent(result.downloadUrl)}&title=${encodeURIComponent(result.title)}`;
-                await downloadViaAppRoute(proxyHref, toDownloadFilename(result.title));
-              } else if (result.error) {
-                throw new Error(result.error);
-              }
-            } catch (err) {
-              const message = err instanceof Error ? err.message : String(err);
-              if (
-                shouldAutoReplace(message) &&
-                typeof result.resultIndex === "number" &&
-                typeof result.slotIndex === "number"
-              ) {
-                await autoReplaceAndDownload(result.resultIndex, result.slotIndex, message);
+            const event = JSON.parse(line) as DownloadBatchEvent;
+
+            if (typeof event.sequenceNumber === "number") {
+              if (event.sequenceNumber !== expectedSequence) {
+                localOrderViolations += 1;
+                expectedSequence = event.sequenceNumber + 1;
               } else {
-                setDownloadErrors((prev) => [
+                expectedSequence += 1;
+              }
+              setOrderAudit({
+                lastSequence: event.sequenceNumber,
+                violations: localOrderViolations,
+              });
+            }
+
+            if (event.status === "retrying" && event.error) {
+              setProgress((prev) => [
+                ...prev,
+                `Retrying ${event.title || "video"} (${event.attempt ?? "?"}/${event.maxAttempts ?? "?"}): ${event.error}`,
+              ]);
+              continue;
+            }
+
+            if (event.status === "summary") {
+              setBatchSummary(event.summary ?? null);
+              if ((event.summary?.orderViolations ?? 0) > 0) {
+                setOrderAudit((prev) => ({
+                  lastSequence: prev.lastSequence,
+                  violations: prev.violations + (event.summary?.orderViolations ?? 0),
+                }));
+              }
+              if (event.summary?.stopped) {
+                setProgress((prev) => [
                   ...prev,
-                  { videoUrl: result.detailUrl, searchUrl: result.searchUrl, error: message },
+                  event.summary?.stopReason || "Batch stopped due to critical error. Resume is available.",
                 ]);
               }
+              continue;
             }
-          } catch { /* malformed line */ }
-          done++;
-          setDownloadAllProgress({ done, total: allVideos.length });
+
+            if (event.status === "done" || event.status === "failed") {
+              await enqueueDownloadTask(async () => {
+                try {
+                  if (event.status === "done" && event.proxyUrl) {
+                    if (event.replacedWith) applyServerReplacement(event);
+                    await downloadViaAppRoute(
+                      event.proxyUrl,
+                      event.suggestedFilename || toDownloadFilename(event.title || "video")
+                    );
+                  } else if (event.status === "done" && event.downloadUrl) {
+                    if (event.replacedWith) applyServerReplacement(event);
+                    const proxyHref = `/api/proxy-file?url=${encodeURIComponent(event.downloadUrl)}&title=${encodeURIComponent(
+                      event.title || "video"
+                    )}&filename=${encodeURIComponent(event.suggestedFilename || toDownloadFilename(event.title || "video"))}`;
+                    await downloadViaAppRoute(
+                      proxyHref,
+                      event.suggestedFilename || toDownloadFilename(event.title || "video")
+                    );
+                  } else if (event.error) {
+                    throw new Error(event.error);
+                  }
+                } catch (err) {
+                  const message = err instanceof Error ? err.message : String(err);
+                  setDownloadErrors((prev) => [
+                    ...prev,
+                    {
+                      videoUrl: event.detailUrl || "",
+                      searchUrl: event.searchUrl || "",
+                      error: message,
+                      title: event.title,
+                      suggestedFilename: event.suggestedFilename,
+                      resultIndex: event.resultIndex,
+                      slotIndex: event.slotIndex,
+                      kind: "failure",
+                    },
+                  ]);
+                } finally {
+                  markItemCompleted();
+                }
+              });
+            }
+          } catch {
+            // Ignore malformed lines.
+          }
         }
       }
+    } catch (err) {
+      setDownloadErrors((prev) => [
+        ...prev,
+        {
+          videoUrl: "",
+          searchUrl: "",
+          error: `Batch stream interrupted: ${err instanceof Error ? err.message : String(err)}`,
+          kind: "failure",
+        },
+      ]);
+      setProgress((prev) => [
+        ...prev,
+        "Batch stream interrupted. You can retry or resume from checkpoint.",
+      ]);
     } finally {
       reader.cancel().catch(() => {});
     }
+    await Promise.all(activeDownloadTasks);
 
     setDownloadingAll(false);
     setDownloadAllProgress(null);
-  }, [autoSelectedSlots, results, cookiesJson, downloadViaAppRoute, toDownloadFilename, getNextReplacementSlot, downloadVideoFromDetail]);
+    if (done >= allVideos.length) {
+      localStorage.removeItem(DOWNLOAD_CHECKPOINT_KEY);
+    }
+  }, [
+    autoSelectedSlots,
+    results,
+    cookiesJson,
+    downloadViaAppRoute,
+    downloadProfile,
+    stopOnCriticalError,
+    toDownloadFilename,
+  ]);
 
   const currentResult = results[currentIndex];
   const currentAutoResult = results[autoSelectIndex];
@@ -423,6 +671,9 @@ export default function Home() {
   const showAutoSelectView = autoSelect && results.length > 0 && !isLoading;
   const showManualView = !autoSelect && results.length > 0 && !isLoading;
   const totalAutoVideos = autoSelectedSlots.reduce((s, slots) => s + slots.length, 0);
+  const shortGroups = autoSelectedSlots
+    .map((slots, i) => ({ index: i, count: slots.length, url: results[i]?.searchUrl ?? "" }))
+    .filter((g) => g.count < videosPerLink);
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100">
@@ -493,6 +744,32 @@ export default function Home() {
                 </div>
               )}
             </div>
+            <div>
+              <label className="block text-sm text-zinc-400 mb-1">Download profile</label>
+              <select
+                value={downloadProfile}
+                onChange={(e) => setDownloadProfile(e.target.value as DownloadProfileName)}
+                className="w-full sm:w-72 bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-300 focus:outline-none focus:border-zinc-500"
+              >
+                <option value="fast">Fast - minimum delays/retries</option>
+                <option value="balanced">Balanced - recommended default</option>
+                <option value="safe">Safe - maximum stability</option>
+                <option value="serial">Serial - one by one, immediately next</option>
+                <option value="teste">Teste - serial with 0.5s delay</option>
+              </select>
+              <p className="text-xs text-zinc-500 mt-1">
+                Use Fast for speed, Safe for stability, Balanced as default.
+              </p>
+            </div>
+            <label className="flex items-center gap-3 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={stopOnCriticalError}
+                onChange={(e) => setStopOnCriticalError(e.target.checked)}
+                className="w-4 h-4 rounded accent-amber-500"
+              />
+              <span className="text-sm text-zinc-300">Stop batch on critical errors (resume later)</span>
+            </label>
             <div className="flex gap-3">
               <button onClick={startScraping} disabled={isLoading}
                 className="px-6 py-2.5 bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-700 disabled:text-zinc-500 text-white rounded-lg font-medium transition">
@@ -530,7 +807,14 @@ export default function Home() {
               </button>
               <div className="text-center space-y-0.5">
                 <span className="text-sm text-zinc-400 block">{autoSelectIndex + 1} / {results.length} URLs</span>
-                <span className="text-xs text-zinc-600">{totalAutoVideos} videos total</span>
+                <span className="text-xs text-zinc-600">
+                  {totalAutoVideos} videos total
+                  {shortGroups.length > 0 && (
+                    <span className="text-amber-500 ml-1">
+                      ({shortGroups.length} URL{shortGroups.length > 1 ? "s" : ""} with fewer than {videosPerLink} videos)
+                    </span>
+                  )}
+                </span>
               </div>
               <button onClick={() => setAutoSelectIndex((prev) => Math.min(results.length - 1, prev + 1))}
                 disabled={autoSelectIndex === results.length - 1}
@@ -547,6 +831,20 @@ export default function Home() {
                     className="text-sm text-blue-400 hover:text-blue-300 break-all">
                     {currentAutoResult.searchUrl}
                   </a>
+                  {currentAutoSlots.length < videosPerLink && (
+                    <div className="flex items-center gap-3 mt-2">
+                      <p className="text-xs text-amber-500">
+                        This search returned only {currentAutoResult.videos.length} video{currentAutoResult.videos.length !== 1 ? "s" : ""} (expected {videosPerLink})
+                      </p>
+                      <button
+                        onClick={() => reScrapeSingleUrl(autoSelectIndex)}
+                        disabled={reScrapingIndex !== null}
+                        className="text-xs px-3 py-1 bg-amber-600 hover:bg-amber-500 disabled:bg-zinc-700 disabled:text-zinc-500 text-white rounded-md transition whitespace-nowrap"
+                      >
+                        {reScrapingIndex === autoSelectIndex ? "Re-scraping..." : "Retry scrape"}
+                      </button>
+                    </div>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
@@ -611,6 +909,21 @@ export default function Home() {
                 </div>
               )}
             </div>
+            {(orderAudit.lastSequence > 0 || batchSummary) && (
+              <div className="text-xs text-zinc-500 space-y-1">
+                <p>
+                  Stream order audit: last sequence #{orderAudit.lastSequence} | violations: {orderAudit.violations}
+                </p>
+                {batchSummary && (
+                  <p>
+                    Run summary: {batchSummary.success}/{batchSummary.total} succeeded
+                    {batchSummary.replaced > 0 && ` (${batchSummary.replaced} auto-replaced)`}
+                    , {batchSummary.failed} failed,
+                    retries {batchSummary.retriesUsed}, backend order violations {batchSummary.orderViolations}
+                  </p>
+                )}
+              </div>
+            )}
           </section>
         )}
 
@@ -656,7 +969,7 @@ export default function Home() {
                             {downloading === video.detailUrl ? (
                               <div className="bg-zinc-900/90 rounded-full px-4 py-2 text-sm">Downloading...</div>
                             ) : (
-                              <div className="bg-blue-600/90 rounded-full px-4 py-2 text-sm font-medium">Click to Download HD Video</div>
+                              <div className="bg-blue-600/90 rounded-full px-4 py-2 text-sm font-medium">Click to Download HD MP4</div>
                             )}
                           </div>
                         </div>
@@ -672,15 +985,15 @@ export default function Home() {
                     </div>
                   ))}
                 </div>
-                <p className="text-center text-xs text-zinc-600">Click videos to download the best HD format available. Use Next/Previous to navigate between URL groups.</p>
+                <p className="text-center text-xs text-zinc-600">Click videos to download HD MP4. Use Next/Previous to navigate between URL groups.</p>
               </div>
             )}
           </section>
         )}
 
-        {(errors.length > 0 || downloadErrors.length > 0) && (
+        {errors.length > 0 && (
           <section className="bg-red-950/30 rounded-xl p-4 border border-red-900/50 space-y-3">
-            <h3 className="text-sm font-medium text-red-400">Errors</h3>
+            <h3 className="text-sm font-medium text-red-400">Scrape Errors</h3>
             {errors.map((err, i) => (
               <div key={`scrape-${i}`} className="text-xs space-y-0.5">
                 <p className="text-red-300">Failed to scrape URL:</p>
@@ -688,16 +1001,134 @@ export default function Home() {
                 <p className="text-red-500/60">{err.error}</p>
               </div>
             ))}
-            {downloadErrors.map((err, i) => (
-              <div key={`dl-${i}`} className="text-xs space-y-0.5">
-                <p className="text-red-300">Failed to download video:</p>
-                <p className="text-red-400/70 font-mono break-all">{err.videoUrl}</p>
-                <p className="text-red-500/60">From: {err.searchUrl}</p>
-                <p className="text-red-500/60">{err.error}</p>
-              </div>
-            ))}
           </section>
         )}
+
+        {downloadErrors.length > 0 && (() => {
+          const failures = downloadErrors.filter((e) => e.kind === "failure");
+          const replacements = downloadErrors.filter((e) => e.kind === "replaced");
+          return (
+            <section className="bg-zinc-900 rounded-xl p-5 border border-amber-900/50 space-y-4">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-medium text-amber-400">
+                  {batchSummary && !downloadingAll
+                    ? `Batch Report — ${failures.length} failed${replacements.length > 0 ? `, ${replacements.length} auto-replaced` : ""}`
+                    : `Download Issues (${downloadErrors.length})`}
+                </h3>
+                <button
+                  onClick={() => setDownloadErrors([])}
+                  className="text-xs text-zinc-500 hover:text-zinc-300 transition"
+                >
+                  Clear
+                </button>
+              </div>
+
+              {failures.length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-xs font-medium text-red-400">Failed</p>
+                  {failures.map((err, i) => (
+                    <div
+                      key={`fail-${i}`}
+                      className="flex items-start gap-3 bg-zinc-950 rounded-lg p-3 border border-red-900/30"
+                    >
+                      <div className="flex-1 min-w-0 space-y-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          {err.suggestedFilename && (
+                            <span className="text-xs font-mono font-semibold text-red-400/90 bg-red-400/10 px-1.5 py-0.5 rounded">
+                              {err.suggestedFilename}
+                            </span>
+                          )}
+                          <span className="text-xs text-zinc-300 truncate">
+                            {err.title || err.videoUrl || "Unknown video"}
+                          </span>
+                        </div>
+                        <p className="text-xs text-red-400/70 truncate" title={err.error}>
+                          {err.error}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {typeof err.resultIndex === "number" && (
+                          <button
+                            onClick={() => setAutoSelectIndex(err.resultIndex!)}
+                            className="text-xs px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-md transition whitespace-nowrap"
+                            title={`Navigate to URL group ${err.resultIndex + 1}`}
+                          >
+                            Group {err.resultIndex + 1}
+                          </button>
+                        )}
+                        {err.videoUrl && (
+                          <a
+                            href={err.videoUrl.startsWith("http") ? err.videoUrl : `https://www.storyblocks.com${err.videoUrl}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-blue-400 rounded-md transition"
+                          >
+                            View
+                          </a>
+                        )}
+                        {err.videoUrl && (
+                          <button
+                            onClick={() => {
+                              setDownloadErrors((prev) => prev.filter((_, idx) => idx !== downloadErrors.indexOf(err)));
+                              handleDownload(err.videoUrl, err.searchUrl, err.title || "video");
+                            }}
+                            disabled={downloading === err.videoUrl}
+                            className="text-xs px-2.5 py-1 bg-blue-700 hover:bg-blue-600 disabled:bg-zinc-700 disabled:text-zinc-500 text-white rounded-md transition"
+                          >
+                            {downloading === err.videoUrl ? "..." : "Retry"}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {replacements.length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-xs font-medium text-green-400">Auto-replaced (downloaded a substitute)</p>
+                  {replacements.map((err, i) => (
+                    <div
+                      key={`repl-${i}`}
+                      className="flex items-start gap-3 bg-zinc-950 rounded-lg p-3 border border-green-900/30"
+                    >
+                      <div className="flex-1 min-w-0 space-y-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          {err.suggestedFilename && (
+                            <span className="text-xs font-mono font-semibold text-green-400/90 bg-green-400/10 px-1.5 py-0.5 rounded">
+                              {err.suggestedFilename}
+                            </span>
+                          )}
+                          <span className="text-xs text-zinc-500 line-through truncate">
+                            {err.title || "Original video"}
+                          </span>
+                          <span className="text-xs text-zinc-600 mx-0.5">&rarr;</span>
+                          <span className="text-xs text-zinc-300 truncate">
+                            {err.replacedWith?.title || "Replacement"}
+                          </span>
+                        </div>
+                        <p className="text-xs text-zinc-500 truncate" title={err.originalError || err.error}>
+                          Reason: {err.originalError || err.error}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {typeof err.resultIndex === "number" && (
+                          <button
+                            onClick={() => setAutoSelectIndex(err.resultIndex!)}
+                            className="text-xs px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-md transition whitespace-nowrap"
+                            title={`Navigate to URL group ${err.resultIndex + 1}`}
+                          >
+                            Group {err.resultIndex + 1}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          );
+        })()}
       </main>
     </div>
   );

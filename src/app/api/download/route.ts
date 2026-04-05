@@ -1,35 +1,39 @@
-import { readFile, rm, stat } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { rm, stat } from "node:fs/promises";
 import path from "node:path";
-import { getDownloadUrl, MAX_DOWNLOAD_BYTES } from "@/lib/scraper";
-import type { StoryblocksCookie } from "@/lib/types";
+import { Readable } from "node:stream";
+import { getDownloadProfile } from "@/lib/download-profiles";
+import { getDownloadUrlWithRetry, MAX_DOWNLOAD_BYTES } from "@/lib/scraper";
+import type { DownloadProfileName, StoryblocksCookie } from "@/lib/types";
 
 export const maxDuration = 120; // 2 minutes max
-
-function getFilenameFromContentDisposition(contentDisposition: string) {
-  const utf8Match = contentDisposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
-  if (utf8Match?.[1]) {
-    return decodeURIComponent(utf8Match[1]).replace(/['"]/g, "").trim();
-  }
-
-  const basicMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/i);
-  return basicMatch?.[1]?.replace(/['"]/g, "").trim() || "";
-}
-
-function getVideoContentType(filename: string, upstreamType?: string | null) {
-  if (upstreamType?.toLowerCase().startsWith("video/")) return upstreamType;
-  if (filename.toLowerCase().endsWith(".mov")) return "video/quicktime";
-  return "video/mp4";
-}
+const VIDEO_CONTENT_TYPE_PATTERN = /video\/|application\/octet-stream/i;
 
 export async function POST(req: Request) {
-  const { detailUrl, cookies }: { detailUrl: string; cookies: StoryblocksCookie[] } = await req.json();
+  const {
+    detailUrl,
+    cookies,
+    profile,
+  }: {
+    detailUrl: string;
+    cookies: StoryblocksCookie[];
+    profile?: DownloadProfileName;
+  } = await req.json();
 
   if (!detailUrl || !cookies?.length) {
     return Response.json({ error: "detailUrl and cookies are required" }, { status: 400 });
   }
 
   try {
-    const result = await getDownloadUrl(detailUrl, cookies);
+    const config = getDownloadProfile(profile);
+    const result = await getDownloadUrlWithRetry(detailUrl, cookies, {
+      maxAttempts: config.maxAttempts,
+      baseDelayMs: config.retryBaseDelayMs,
+      maxDelayMs: config.retryMaxDelayMs,
+      captureTimeoutMs: config.captureTimeoutMs,
+      downloadTimeoutMs: config.downloadTimeoutMs,
+      loginVerified: true,
+    });
     const { downloadUrl, error, loggedIn, localFilePath } = result;
 
     if (error || (!downloadUrl && !localFilePath)) {
@@ -46,15 +50,17 @@ export async function POST(req: Request) {
         return Response.json({ error: "File exceeds 100 MB limit", loggedIn }, { status: 413 });
       }
 
-      const fileBuffer = await readFile(localFilePath);
       const filename = result.filename || path.basename(localFilePath) || "video.mp4";
-      await rm(path.dirname(localFilePath), { recursive: true, force: true }).catch(() => {});
+      const stream = createReadStream(localFilePath);
+      stream.on("close", () => {
+        void rm(path.dirname(localFilePath), { recursive: true, force: true }).catch(() => {});
+      });
 
-      return new Response(fileBuffer, {
+      return new Response(Readable.toWeb(stream) as ReadableStream, {
         headers: {
-          "Content-Type": getVideoContentType(filename),
+          "Content-Type": "video/mp4",
           "Content-Disposition": `attachment; filename="${filename}"`,
-          "Content-Length": String(fileBuffer.byteLength),
+          "Content-Length": String(localStat.size),
         },
       });
     }
@@ -79,9 +85,23 @@ export async function POST(req: Request) {
     if (contentLength > MAX_DOWNLOAD_BYTES) {
       return Response.json({ error: "File exceeds 100 MB limit", loggedIn }, { status: 413 });
     }
+    const remoteContentType = (fileResponse.headers.get("content-type") || "").toLowerCase();
+    const looksLikeVideoType = VIDEO_CONTENT_TYPE_PATTERN.test(remoteContentType);
+    const looksLikeVideoUrl = /\.mp4(\?|$)|\.mov(\?|$)|\.m4v(\?|$)/i.test(downloadUrl);
+    if (!looksLikeVideoType && !looksLikeVideoUrl) {
+      return Response.json(
+        {
+          error: `Unexpected content type from source: ${remoteContentType || "unknown"}`,
+          loggedIn,
+          downloadUrl,
+        },
+        { status: 502 }
+      );
+    }
 
     const contentDisposition = fileResponse.headers.get("content-disposition") ?? "";
-    const cdFilename = getFilenameFromContentDisposition(contentDisposition);
+    const cdMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
+    const cdFilename = cdMatch?.[1]?.replace(/['"]/g, "").trim();
     const urlFilename = (() => {
       try {
         const parts = new URL(downloadUrl).pathname.split("/");
@@ -94,7 +114,7 @@ export async function POST(req: Request) {
 
     return new Response(fileResponse.body, {
       headers: {
-        "Content-Type": getVideoContentType(filename, fileResponse.headers.get("content-type")),
+        "Content-Type": remoteContentType || "video/mp4",
         "Content-Disposition": `attachment; filename="${filename}"`,
         ...(fileResponse.headers.get("content-length")
           ? { "Content-Length": fileResponse.headers.get("content-length")! }

@@ -9,21 +9,80 @@ import type {
   StoryblocksCookie,
   VideoInfo,
 } from "./types";
+import { classifyDownloadError, computeBackoffMs, type DownloadErrorClass } from "./download-queue";
 
 const STORYBLOCKS_ORIGIN = "https://www.storyblocks.com";
 const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const OPERATION_DELAY_MS = 500;
-const CAPTURE_TIMEOUT_MS = 15000;
-const DOWNLOAD_TIMEOUT_MS = 25000;
+const DEFAULT_CAPTURE_TIMEOUT_MS = 15000;
+const DEFAULT_DOWNLOAD_TIMEOUT_MS = 25000;
+const HARD_DOWNLOAD_TIMEOUT_MS = 60000;
 const DOWNLOAD_POLL_MS = 250;
-const DOWNLOAD_ATTEMPT_TIMEOUT_MS = 60000;
-const MAX_DOWNLOAD_ATTEMPTS = 2;
 const SCRAPE_CONCURRENCY = 6;
+const SCRAPE_MAX_ATTEMPTS = 3;
+const SCRAPE_RETRY_BASE_MS = 2000;
+const SCRAPE_RETRY_MAX_MS = 12000;
+const SCRAPE_CHALLENGE_COOLDOWN_MS = 8000;
 export const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 export const DOWNLOAD_CACHE_ROOT = path.join(os.tmpdir(), "automatic-cosmos-storyblocks");
+const SCRAPER_BROWSER_ARGS = ["--no-sandbox", "--disable-setuid-sandbox"];
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function runStepWithRetry<T>(
+  stepName: string,
+  operation: () => Promise<T>,
+  attempts = 2,
+  baseDelayMs = 700
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await operation();
+    } catch (err) {
+      lastError = err;
+      if (attempt < attempts) {
+        const jitter = Math.floor(Math.random() * 300);
+        await delay(baseDelayMs * attempt + jitter);
+      }
+    }
+  }
+  throw new Error(`${stepName} failed after ${attempts} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+}
+
+export function launchScraperBrowser() {
+  return puppeteer.launch({
+    headless: true,
+    args: SCRAPER_BROWSER_ARGS,
+  });
+}
+
+export async function verifyLogin(
+  browser: Browser,
+  cookies: StoryblocksCookie[]
+): Promise<{ loggedIn: boolean; error?: string }> {
+  const page = await browser.newPage();
+  try {
+    await configurePage(page, cookies);
+    await page.goto(STORYBLOCKS_ORIGIN, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await delay(300);
+    const state = await inspectAccountState(page, 5000);
+    if (state.challengeLikely) {
+      return { loggedIn: false, error: `Challenge/rate-limit: ${state.challengeSignals.join(", ")}` };
+    }
+    if (state.explicitLoggedOut) {
+      return { loggedIn: false, error: "Not logged in — cookies may be expired or invalid" };
+    }
+    // If not explicitly logged out and no challenge, assume cookies are valid.
+    // Detail page downloads will catch real auth issues.
+    return { loggedIn: true };
+  } catch (err) {
+    return { loggedIn: false, error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
 
 function normalizeStoryblocksUrl(url: string) {
   return url.startsWith("http") ? url : `${STORYBLOCKS_ORIGIN}${url}`;
@@ -31,20 +90,6 @@ function normalizeStoryblocksUrl(url: string) {
 
 function sanitizeFilename(filename: string) {
   return filename.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim() || "video.mp4";
-}
-
-function parseFilenameFromContentDisposition(contentDisposition: string) {
-  const utf8Match = contentDisposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
-  if (utf8Match?.[1]) {
-    return sanitizeFilename(decodeURIComponent(utf8Match[1]).replace(/['"]/g, "").trim());
-  }
-
-  const basicMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/i);
-  if (basicMatch?.[1]) {
-    return sanitizeFilename(basicMatch[1].replace(/['"]/g, "").trim());
-  }
-
-  return "";
 }
 
 function isPreviewUrl(url: string) {
@@ -62,9 +107,35 @@ function isLikelyMediaDownloadUrl(url: string) {
   const lower = url.toLowerCase();
   return (
     lower.includes("/content/video/") ||
+    lower.includes("/video/download") ||
+    lower.includes("/download/video") ||
+    lower.includes("/api/download") ||
     lower.includes("response-content-disposition=attachment") ||
-    /\.(mp4|mov)(\?|$)/i.test(lower)
+    /\.(mp4|mov|m4v)(\?|$)/i.test(lower)
   );
+}
+
+function isBlockedTrackingUrl(url: string) {
+  if (!url.startsWith("http")) return true;
+  const lower = url.toLowerCase();
+  return (
+    lower.includes("googleads.g.doubleclick.net") ||
+    lower.includes("doubleclick.net") ||
+    lower.includes("googlesyndication.com") ||
+    lower.includes("google-analytics.com") ||
+    lower.includes("/pagead/") ||
+    lower.includes("intercom.io") ||
+    lower.includes("zoominfo.com") ||
+    lower.includes("hubspot.com") ||
+    lower.includes("analytics.google.com")
+  );
+}
+
+function isTrustedMediaCandidate(url: string) {
+  if (!url.startsWith("http")) return false;
+  if (isPreviewUrl(url)) return false;
+  if (isBlockedTrackingUrl(url)) return false;
+  return isLikelyMediaDownloadUrl(url);
 }
 
 function extractCandidateUrls(value: unknown, depth = 0): string[] {
@@ -85,6 +156,24 @@ function extractCandidateUrls(value: unknown, depth = 0): string[] {
   }
 
   return [];
+}
+
+async function detectChallengeSignals(page: Page) {
+  return page
+    .evaluate(() => {
+      const pageText = (document.body?.innerText || "").toLowerCase();
+      const signals = [
+        "too many requests",
+        "verify you are human",
+        "captcha",
+        "unusual traffic",
+        "temporarily blocked",
+        "access denied",
+        "rate limit",
+      ];
+      return signals.filter((signal) => pageText.includes(signal));
+    })
+    .catch(() => [] as string[]);
 }
 
 function toPuppeteerCookies(cookies: StoryblocksCookie[]) {
@@ -120,7 +209,7 @@ async function inspectAccountState(page: Page, timeoutMs = 12000) {
     .waitForFunction(() => {
       const textOf = (el: Element) => (el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
       const getRank = (value: string) => {
-        const normalized = value.toLowerCase().replace(/\s+/g, "");
+        const normalized = value.toLowerCase().replace(/[^a-z0-9]/g, "");
         if (normalized.includes("4k")) return -1;
         if (normalized.includes("hdmp4") || normalized.includes("mp4hd")) return 2;
         if (normalized.includes("hdmov") || normalized.includes("movhd")) return 1;
@@ -128,6 +217,13 @@ async function inspectAccountState(page: Page, timeoutMs = 12000) {
       };
       const clickables = Array.from(document.querySelectorAll("a, button, [role='button'], summary"));
       const labels = Array.from(document.querySelectorAll("label, [role='radio']"));
+      const pageText = (document.body?.innerText || "").toLowerCase();
+      const hasChallenge =
+        pageText.includes("too many requests") ||
+        pageText.includes("verify you are human") ||
+        pageText.includes("captcha") ||
+        pageText.includes("unusual traffic") ||
+        pageText.includes("temporarily blocked");
 
       const hasMyAccount = clickables.some((el) => textOf(el).includes("my account"));
       const hasDownloadButton = clickables.some((el) => textOf(el).includes("download"));
@@ -135,14 +231,14 @@ async function inspectAccountState(page: Page, timeoutMs = 12000) {
         return getRank(textOf(el)) > 0;
       });
 
-      return hasMyAccount || hasHdMp4 || hasDownloadButton;
+      return hasMyAccount || hasHdMp4 || hasDownloadButton || hasChallenge;
     }, { timeout: timeoutMs })
     .catch(() => {});
 
   return page.evaluate(() => {
     const textOf = (el: Element) => (el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
     const getRank = (value: string) => {
-      const normalized = value.toLowerCase().replace(/\s+/g, "");
+      const normalized = value.toLowerCase().replace(/[^a-z0-9]/g, "");
       if (normalized.includes("4k")) return -1;
       if (normalized.includes("hdmp4") || normalized.includes("mp4hd")) return 2;
       if (normalized.includes("hdmov") || normalized.includes("movhd")) return 1;
@@ -151,6 +247,7 @@ async function inspectAccountState(page: Page, timeoutMs = 12000) {
     const clickables = Array.from(document.querySelectorAll("a, button, [role='button'], summary"));
     const labels = Array.from(document.querySelectorAll("label, [role='radio']"));
     const pageUrl = window.location.href.toLowerCase();
+    const pageText = (document.body?.innerText || "").toLowerCase();
 
     const hasMyAccount = clickables.some((el) => textOf(el).includes("my account"));
     const hasSignIn = clickables.some((el) => {
@@ -167,6 +264,16 @@ async function inspectAccountState(page: Page, timeoutMs = 12000) {
       return getRank(textOf(el)) > 0;
     });
     const hasDownloadButton = clickables.some((el) => textOf(el).includes("download"));
+    const challengeSignals = [
+      "too many requests",
+      "verify you are human",
+      "captcha",
+      "unusual traffic",
+      "temporarily blocked",
+      "access denied",
+      "rate limit",
+    ].filter((signal) => pageText.includes(signal));
+    const challengeLikely = challengeSignals.length > 0;
     const explicitLoggedOut =
       pageUrl.includes("/login") ||
       pageUrl.includes("/sign-in") ||
@@ -182,6 +289,8 @@ async function inspectAccountState(page: Page, timeoutMs = 12000) {
       hasHdMp4,
       explicitLoggedOut,
       loggedInLikely,
+      challengeLikely,
+      challengeSignals,
       loggedIn: loggedInLikely && !explicitLoggedOut,
     };
   });
@@ -203,7 +312,7 @@ async function waitForPreferredFormatUi(page: Page, timeoutMs: number) {
 async function getSelectedDownloadFormat(page: Page) {
   return page.evaluate(() => {
     const normalizeFormatName = (value: string) => {
-      const upper = value.toUpperCase().replace(/\s+/g, "");
+      const upper = value.toUpperCase().replace(/[^A-Z0-9]/g, "");
       if (upper.includes("4KMP4") || upper === "4K") return "4K";
       if (upper.includes("HDMP4") || upper.includes("MP4HD")) return "HDMP4";
       if (upper.includes("HDMOV") || upper.includes("MOVHD")) return "HDMOV";
@@ -239,12 +348,94 @@ async function getSelectedDownloadFormat(page: Page) {
   });
 }
 
+async function runDownloadFlow(
+  page: Page,
+  accountState: Awaited<ReturnType<typeof inspectAccountState>> | undefined,
+  maxBytes: number
+) {
+  const ensureFormatUi = async (timeoutMs: number) => {
+    return runStepWithRetry(
+      "Find format options",
+      async () => {
+        const hasFormatUi = await waitForPreferredFormatUi(page, timeoutMs);
+        if (!hasFormatUi) {
+          throw new Error("Could not find format options");
+        }
+        return true;
+      },
+      2,
+      700
+    );
+  };
+
+  const selectAndValidatePreferredFormat = async () => {
+    return runStepWithRetry(
+      "Select preferred format",
+      async () => {
+        const selectedFormat = await selectPreferredDownloadFormat(page, maxBytes);
+        if (!selectedFormat) {
+          throw new Error("No supported HD format under 100 MB (HDMP4 or HDMOV)");
+        }
+        await delay(OPERATION_DELAY_MS);
+        const activeFormat = await getSelectedDownloadFormat(page);
+        if (activeFormat !== "HDMP4" && activeFormat !== "HDMOV") {
+          throw new Error(`Failed to switch away from ${activeFormat || "default"} format`);
+        }
+        return selectedFormat;
+      },
+      2,
+      700
+    );
+  };
+
+  const clickDownloadWithRetry = async (
+    messageWhenMissing: string,
+    options?: { preferOverlay?: boolean }
+  ) => {
+    return runStepWithRetry(
+      "Find/click download button",
+      async () => {
+        let clicked = await clickDownloadButton(page, options);
+        if (!clicked && options?.preferOverlay) {
+          // Some pages expose the actionable button outside overlay roots.
+          clicked = await clickDownloadButton(page, { preferOverlay: false });
+        }
+        if (!clicked) {
+          throw new Error(
+            accountState?.explicitLoggedOut
+              ? "Not logged in — cookies may be expired or invalid"
+              : messageWhenMissing
+          );
+        }
+        return true;
+      },
+      2,
+      700
+    );
+  };
+
+  const hasInitialHdOption = await waitForPreferredFormatUi(page, 1500);
+  if (hasInitialHdOption) {
+    await selectAndValidatePreferredFormat();
+    await delay(OPERATION_DELAY_MS);
+    await clickDownloadWithRetry("Could not find the Download button on the page", { preferOverlay: true });
+    return;
+  }
+
+  await clickDownloadWithRetry("Could not find the Download button on the page");
+  await delay(OPERATION_DELAY_MS);
+  await ensureFormatUi(2500);
+  await selectAndValidatePreferredFormat();
+  await clickDownloadWithRetry("Could not confirm the HD download", { preferOverlay: true });
+}
+
 async function selectPreferredDownloadFormat(page: Page, maxBytes: number) {
   return page.evaluate((sizeLimitBytes: number) => {
     const parseBytes = (value: string) => {
-      const match = value.match(/-\s*([\d.]+)\s*(KB|MB|GB)\b/i);
+      // Supports labels like "HD MP4 (hevc) 1.4 MB", "HD MOV - 84 MB", and "1.4MB".
+      const match = value.match(/([\d]+(?:[.,]\d+)?)\s*(KB|MB|GB)\b/i);
       if (!match) return Number.POSITIVE_INFINITY;
-      const amount = Number(match[1]);
+      const amount = Number(match[1].replace(",", "."));
       const unit = match[2].toUpperCase();
       if (unit === "KB") return amount * 1024;
       if (unit === "MB") return amount * 1024 * 1024;
@@ -252,7 +443,7 @@ async function selectPreferredDownloadFormat(page: Page, maxBytes: number) {
       return Number.POSITIVE_INFINITY;
     };
     const getRankFromText = (value: string) => {
-      const normalized = value.toUpperCase().replace(/\s+/g, "");
+      const normalized = value.toUpperCase().replace(/[^A-Z0-9]/g, "");
       if (normalized.includes("4KMP4") || normalized === "4K") return -1;
       if (normalized.includes("HDMP4") || normalized.includes("MP4HD")) return 2;
       if (normalized.includes("HDMOV") || normalized.includes("MOVHD")) return 1;
@@ -396,22 +587,18 @@ async function clickDownloadButton(page: Page, options?: { preferOverlay?: boole
   }, options?.preferOverlay ?? false);
 }
 
-async function createDownloadDirectory(browser: Browser) {
+async function createDownloadDirectory(context: import("puppeteer").BrowserContext) {
   await mkdir(DOWNLOAD_CACHE_ROOT, { recursive: true });
   const downloadDir = await mkdtemp(path.join(DOWNLOAD_CACHE_ROOT, "job-"));
 
-  // Puppeteer exposes this on the concrete Chromium context even though the
-  // public BrowserContext type doesn't currently declare it.
-  const browserContext = browser.defaultBrowserContext() as Browser["defaultBrowserContext"] extends () => infer T
-    ? T & {
-        setDownloadBehavior: (downloadBehavior: {
-          policy: "allow";
-          downloadPath: string;
-        }) => Promise<void>;
-      }
-    : never;
+  const typedContext = context as typeof context & {
+    setDownloadBehavior: (downloadBehavior: {
+      policy: "allow";
+      downloadPath: string;
+    }) => Promise<void>;
+  };
 
-  await browserContext.setDownloadBehavior({
+  await typedContext.setDownloadBehavior({
     policy: "allow",
     downloadPath: downloadDir,
   });
@@ -462,53 +649,6 @@ async function cleanupDownloadArtifacts(targetPath?: string) {
   await rm(targetPath, { recursive: true, force: true }).catch(() => {});
 }
 
-type DownloadLookupResult = {
-  downloadUrl: string;
-  filename?: string;
-  loggedIn?: boolean;
-  error?: string;
-  localFilePath?: string;
-};
-
-function isRetryableDownloadError(error?: string) {
-  if (!error) return false;
-
-  const message = error.toLowerCase();
-  return (
-    message.includes("timed out after 60 seconds") ||
-    message.includes("could not find the download button") ||
-    message.includes("could not confirm the hd download") ||
-    message.includes("no supported hd format under") ||
-    message.includes("failed to switch away from") ||
-    message.includes("no hd video url or file was captured")
-  );
-}
-
-async function waitForSearchCards(page: Page, timeoutMs: number) {
-  return page
-    .waitForFunction(() => {
-      const textOf = (el: Element) => (el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
-      const candidateLinks = Array.from(document.querySelectorAll("a[href*='/video/stock/']")).filter((el) => {
-        if (el.closest("header") || el.closest("nav") || el.closest("footer")) return false;
-        const href = el.getAttribute("href") || "";
-        const label = `${el.getAttribute("aria-label") || ""} ${textOf(el)}`.trim();
-        return href.includes("/video/stock/") && (label.length > 0 || !!el.querySelector("img, video, picture"));
-      });
-
-      if (candidateLinks.length > 0) return true;
-
-      const pageText = textOf(document.body);
-      return (
-        pageText.includes("no results") ||
-        pageText.includes("0 results") ||
-        pageText.includes("did not match any results") ||
-        pageText.includes("we couldn't find")
-      );
-    }, { timeout: timeoutMs })
-    .then(() => true)
-    .catch(() => false);
-}
-
 async function scrapeSingleSearchUrl(
   browser: Browser,
   url: string,
@@ -524,36 +664,17 @@ async function scrapeSingleSearchUrl(
     onProgress?.({ type: "progress", message: `Opening URL ${position}/${total}: ${url}` });
 
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await delay(OPERATION_DELAY_MS);
 
-    let cardsReady = await waitForSearchCards(page, 15000);
-    if (!cardsReady) {
-      await page.reload({ waitUntil: "networkidle2", timeout: 30000 }).catch(() => null);
-      await delay(OPERATION_DELAY_MS);
-      await page.evaluate(() => window.scrollTo({ top: document.body.scrollHeight * 0.25, behavior: "instant" })).catch(() => null);
-      await delay(350);
-      cardsReady = await waitForSearchCards(page, 8000);
-    }
-
-    if (!cardsReady) {
-      throw new Error("Could not find Storyblocks result cards on the search page");
-    }
+    await page.waitForSelector('[class*="image-link"], [data-testid*="video"], a[href*="/video/"]', {
+      timeout: 10000,
+    });
 
     const videoCards = await page.evaluate(() => {
-      const textOf = (el: Element) => (el.textContent || "").replace(/\s+/g, " ").trim();
-      const candidateCards = Array.from(document.querySelectorAll("a[href*='/video/stock/']")).filter((el) => {
-        if (el.closest("header") || el.closest("nav") || el.closest("footer")) return false;
-        const href = el.getAttribute("href") || "";
-        const label = `${el.getAttribute("aria-label") || ""} ${textOf(el)}`.trim();
-        return href.includes("/video/stock/") && (label.length > 0 || !!el.querySelector("img, video, picture"));
-      });
+      let cards = Array.from(document.querySelectorAll("a.image-link"));
+      if (cards.length === 0) cards = Array.from(document.querySelectorAll('a[href*="/video/stock/"]'));
+      if (cards.length === 0) cards = Array.from(document.querySelectorAll('[data-testid*="video"] a'));
 
-      const dedupedCards = candidateCards.filter((card, index, list) => {
-        const href = card.getAttribute("href") || "";
-        return href && list.findIndex((other) => (other.getAttribute("href") || "") === href) === index;
-      });
-
-      return dedupedCards.slice(0, 6).map((card) => {
+      return cards.slice(0, 12).map((card) => {
         const anchor = card.closest("a") || card;
         const videoEl = card.querySelector("video");
         const sourceEl = videoEl?.querySelector("source");
@@ -581,72 +702,108 @@ async function scrapeSingleSearchUrl(
     });
 
     const videos: VideoInfo[] = [...videoCards];
-    const cardElements = await page.$$("a[href*='/video/stock/']");
     const needsHover = videos.some((video) => !video.previewVideoUrl);
 
     if (needsHover) {
-      for (let j = 0; j < Math.min(6, cardElements.length, videos.length); j++) {
-        if (videos[j].previewVideoUrl) continue;
-        try {
-          await cardElements[j].hover();
-          for (let t = 0; t < 10; t++) {
-            await delay(100);
-            const src = await cardElements[j].evaluate((el) => {
-              const video = el.querySelector("video");
-              if (!video) return "";
-              return (
-                video.getAttribute("src") ||
-                video.querySelector("source")?.getAttribute("src") ||
-                (video as HTMLVideoElement).currentSrc ||
-                ""
-              );
-            });
-            if (src) {
-              videos[j].previewVideoUrl = src;
-              break;
-            }
-          }
-        } catch {
-          // Keep empty preview if hover extraction fails.
-        }
-      }
-    }
+      const previewUrls: string[] = await page.evaluate(async () => {
+        const getVideoSrc = (el: Element) => {
+          const v = el.querySelector("video");
+          if (!v) return "";
+          return v.getAttribute("src") || v.querySelector("source")?.getAttribute("src") || (v as HTMLVideoElement).currentSrc || "";
+        };
 
-    const needsDetailScrape = videos.some((video) => !video.previewVideoUrl && video.detailUrl);
-    if (needsDetailScrape) {
-      onProgress?.({ type: "progress", message: `Loading detail pages for URL ${position}...` });
-      for (let j = 0; j < videos.length; j++) {
-        if (videos[j].previewVideoUrl || !videos[j].detailUrl) continue;
-        try {
-          await page.goto(normalizeStoryblocksUrl(videos[j].detailUrl), {
-            waitUntil: "domcontentloaded",
-            timeout: 20000,
-          });
-          await delay(OPERATION_DELAY_MS);
-          const previewUrl = await page.evaluate(() => {
-            const video = document.querySelector("video");
-            if (!video) return "";
-            return (
-              video.getAttribute("src") ||
-              video.querySelector("source")?.getAttribute("src") ||
-              (video as HTMLVideoElement).currentSrc ||
-              ""
-            );
-          });
-          videos[j].previewVideoUrl = previewUrl || "";
-        } catch {
-          // Leave preview empty.
+        const cards = Array.from(document.querySelectorAll("a.image-link, a[href*='/video/stock/']")).slice(0, 12);
+
+        for (const card of cards) {
+          card.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+          card.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+        }
+
+        const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+        const results = new Array<string>(cards.length).fill("");
+
+        for (let tick = 0; tick < 8; tick++) {
+          await wait(150);
+          let allResolved = true;
+          for (let i = 0; i < cards.length; i++) {
+            if (results[i]) continue;
+            const src = getVideoSrc(cards[i]);
+            if (src) results[i] = src;
+            else allResolved = false;
+          }
+          if (allResolved) break;
+        }
+        return results;
+      });
+
+      for (let j = 0; j < Math.min(videos.length, previewUrls.length); j++) {
+        if (!videos[j].previewVideoUrl && previewUrls[j]) {
+          videos[j].previewVideoUrl = previewUrls[j];
         }
       }
     }
 
     return { ok: true as const, result: { searchUrl: url, videos } };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    let message = err instanceof Error ? err.message : String(err);
+    if (/waiting for selector|timeout|timed out/i.test(message)) {
+      const signals = await detectChallengeSignals(page);
+      if (signals.length > 0) {
+        message = `Challenge/rate-limit page detected: ${signals.join(", ")}`;
+      }
+    }
     return { ok: false as const, error: { url, error: `Failed to scrape: ${message}` } };
   } finally {
     await page.close().catch(() => {});
   }
+}
+
+async function scrapeSingleSearchUrlWithRetry(
+  browser: Browser,
+  url: string,
+  cookies: StoryblocksCookie[],
+  position: number,
+  total: number,
+  onProgress?: (event: ProgressEvent) => void
+) {
+  type ScrapeOutcome = Awaited<ReturnType<typeof scrapeSingleSearchUrl>>;
+  let lastOutcome: ScrapeOutcome | undefined;
+
+  for (let attempt = 1; attempt <= SCRAPE_MAX_ATTEMPTS; attempt++) {
+    const outcome = await scrapeSingleSearchUrl(browser, url, cookies, position, total, onProgress);
+    lastOutcome = outcome;
+    if (outcome.ok) return outcome;
+
+    const message = outcome.error.error;
+    const retryable = /challenge|too many requests|captcha|unusual traffic|temporarily blocked|rate limit|waiting for selector|timeout|timed out|net::|navigation/i.test(
+      message
+    );
+    if (!retryable || attempt >= SCRAPE_MAX_ATTEMPTS) {
+      return outcome;
+    }
+
+    const isChallenge = /challenge|too many requests|captcha|unusual traffic|temporarily blocked|rate limit/i.test(
+      message
+    );
+    const backoffMs = computeBackoffMs(attempt, SCRAPE_RETRY_BASE_MS, SCRAPE_RETRY_MAX_MS, 0.35);
+    const extraCooldown = isChallenge ? SCRAPE_CHALLENGE_COOLDOWN_MS : 0;
+    const jitterMs = Math.floor(Math.random() * 700);
+    const waitMs = backoffMs + extraCooldown + jitterMs;
+    onProgress?.({
+      type: "progress",
+      message: `Retrying scrape URL ${position}/${total} (attempt ${attempt + 1}/${SCRAPE_MAX_ATTEMPTS}) in ${Math.ceil(
+        waitMs / 1000
+      )}s: ${url}`,
+    });
+    await delay(waitMs);
+  }
+
+  return (
+    lastOutcome ?? {
+      ok: false as const,
+      error: { url, error: "Failed to scrape: unknown retry state" },
+    }
+  );
 }
 
 export async function scrapeSearchUrls(
@@ -657,10 +814,7 @@ export async function scrapeSearchUrls(
   const results: SearchResult[] = [];
   const errors: ScrapeError[] = [];
 
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-  });
+  const browser = await launchScraperBrowser();
 
   try {
     const orderedOutcomes = new Array<Awaited<ReturnType<typeof scrapeSingleSearchUrl>>>(urls.length);
@@ -669,7 +823,7 @@ export async function scrapeSearchUrls(
       const batch = urls.slice(start, start + SCRAPE_CONCURRENCY);
       const batchOutcomes = await Promise.all(
         batch.map((url, offset) =>
-          scrapeSingleSearchUrl(browser, url, cookies, start + offset + 1, urls.length, onProgress)
+          scrapeSingleSearchUrlWithRetry(browser, url, cookies, start + offset + 1, urls.length, onProgress)
         )
       );
 
@@ -703,94 +857,130 @@ export async function scrapeSearchUrls(
       else errors.push(outcome.error);
     }
   } finally {
-    await browser.close();
+    await browser.close().catch(() => {});
   }
 
   onProgress?.({ type: "done", data: { results, errors } });
   return { results, errors };
 }
 
-async function getDownloadUrlOnce(
+export async function getDownloadUrl(
   detailUrl: string,
   cookies: StoryblocksCookie[],
-  sharedBrowser?: Browser
-): Promise<DownloadLookupResult> {
-  const ownsBrowser = !sharedBrowser;
-  const browser =
-    sharedBrowser ??
-    (await puppeteer.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    }));
+  options: {
+    sharedBrowser?: Browser;
+    captureTimeoutMs?: number;
+    downloadTimeoutMs?: number;
+    loginVerified?: boolean;
+  } = {}
+): Promise<{ downloadUrl: string; filename?: string; loggedIn?: boolean; error?: string; localFilePath?: string }> {
+  const ownsBrowser = !options.sharedBrowser;
+  const browser = options.sharedBrowser ?? (await launchScraperBrowser());
+  const captureTimeoutMs = options.captureTimeoutMs ?? DEFAULT_CAPTURE_TIMEOUT_MS;
+  const downloadTimeoutMs = options.downloadTimeoutMs ?? DEFAULT_DOWNLOAD_TIMEOUT_MS;
 
   let page: Page | undefined;
   let downloadDir: string | undefined;
   let keepLocalFilePath: string | undefined;
+  let isolatedContext: import("puppeteer").BrowserContext | undefined;
+  const observedPages: Page[] = [];
   let requestHandler: ((request: { url(): string }) => void) | undefined;
   let responseHandler: ((response: HTTPResponse) => Promise<void>) | undefined;
+  let targetCreatedHandler: ((target: import("puppeteer").Target) => void) | undefined;
+  const recentNetworkHints: string[] = [];
   let accountState:
     | Awaited<ReturnType<typeof inspectAccountState>>
     | undefined;
 
   try {
-    page = await browser.newPage();
+    isolatedContext = await browser.createBrowserContext();
+    page = await isolatedContext.newPage();
     await configurePage(page, cookies);
 
     const fullUrl = normalizeStoryblocksUrl(detailUrl);
-    await page.goto(fullUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await delay(OPERATION_DELAY_MS);
-
-    accountState = await inspectAccountState(page, 6000);
-
-    if (!accountState.loggedInLikely && !accountState.explicitLoggedOut) {
-      await delay(2500);
-      accountState = await inspectAccountState(page, 8000);
+    try {
+      await runStepWithRetry(
+        "Open page",
+        async () => {
+          await page!.goto(fullUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+          await delay(OPERATION_DELAY_MS);
+        },
+        2,
+        900
+      );
+    } catch (error) {
+      return {
+        downloadUrl: "",
+        loggedIn: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
 
-    if (!accountState.loggedInLikely && !accountState.explicitLoggedOut) {
-      await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => null);
-      await delay(OPERATION_DELAY_MS);
-      accountState = await inspectAccountState(page, 8000);
+    if (options.loginVerified) {
+      const signals = await detectChallengeSignals(page);
+      if (signals.length > 0) {
+        return {
+          downloadUrl: "",
+          loggedIn: false,
+          error: `Challenge/rate-limit page detected: ${signals.join(", ")}`,
+        };
+      }
+    } else {
+      accountState = await inspectAccountState(page, 4000);
+
+      if (accountState.challengeLikely) {
+        return {
+          downloadUrl: "",
+          loggedIn: false,
+          error: `Challenge/rate-limit page detected: ${accountState.challengeSignals.join(", ") || "unknown signal"}`,
+        };
+      }
     }
 
-    downloadDir = await createDownloadDirectory(browser);
+    downloadDir = await createDownloadDirectory(isolatedContext);
     const existingFiles = new Set(await readdir(downloadDir).catch(() => []));
 
     let captureResolved = false;
-    let resolveCapture!: (capture: { url: string; filename?: string }) => void;
-    const capturePromise = new Promise<{ url: string; filename?: string }>((resolve) => {
-      resolveCapture = (capture) => {
-        const filename = capture.filename || "";
-        const filenameLooksVideo = /\.(mp4|mov)(\?|$)/i.test(filename);
-        if (captureResolved || (!isLikelyMediaDownloadUrl(capture.url) && !filenameLooksVideo)) return;
+    let capturedUrl: string | undefined;
+    let resolveCapture!: (url: string) => void;
+    let resolveCapturePromise!: (url: string) => void;
+    const capturePromise = new Promise<string>((resolve) => {
+      resolveCapturePromise = resolve;
+      resolveCapture = (url: string) => {
+        if (captureResolved || !isTrustedMediaCandidate(url)) return;
         captureResolved = true;
-        resolve({
-          url: capture.url,
-          filename: filename ? sanitizeFilename(filename) : undefined,
-        });
+        capturedUrl = url;
+        resolveCapturePromise(url);
       };
     });
+    const resolveCaptureDirect = (url: string) => {
+      if (captureResolved || !isTrustedMediaCandidate(url)) return;
+      captureResolved = true;
+      capturedUrl = url;
+      resolveCapturePromise(url);
+    };
 
     requestHandler = (request) => {
-      resolveCapture({ url: request.url() });
+      resolveCapture(request.url());
     };
 
     responseHandler = async (response) => {
       const responseUrl = response.url();
+      const status = response.status();
       const location = response.headers()["location"] ?? "";
-      const contentDisposition = response.headers()["content-disposition"] ?? "";
+      resolveCapture(responseUrl);
+      resolveCapture(location);
       const contentType = response.headers()["content-type"] ?? "";
-      const filename = parseFilenameFromContentDisposition(contentDisposition);
-      const looksLikeVideoResponse =
-        contentDisposition.toLowerCase().includes("attachment") ||
-        contentType.toLowerCase().startsWith("video/");
+      recentNetworkHints.push(`${status} ${contentType.split(";")[0] || "unknown"} ${responseUrl.slice(0, 180)}`);
+      if (recentNetworkHints.length > 10) recentNetworkHints.shift();
+      if (contentType.toLowerCase().startsWith("video/") && !isBlockedTrackingUrl(responseUrl)) {
+        resolveCaptureDirect(responseUrl);
+      }
 
-      if (looksLikeVideoResponse) {
-        resolveCapture({ url: responseUrl, filename });
-        if (location) resolveCapture({ url: location, filename });
-      } else {
-        resolveCapture({ url: responseUrl });
-        if (location) resolveCapture({ url: location });
+      const contentDisposition = response.headers()["content-disposition"] ?? "";
+      if (contentDisposition.toLowerCase().includes("attachment")) {
+        resolveCapture(responseUrl);
+        resolveCapture(location);
       }
 
       if (!contentType.includes("json")) return;
@@ -799,150 +989,83 @@ async function getDownloadUrlOnce(
         const body = await response.json();
         const candidates = extractCandidateUrls(body);
         for (const candidate of candidates) {
-          resolveCapture({ url: candidate });
+          resolveCapture(candidate);
         }
       } catch {
         // Ignore JSON parsing issues from non-download responses.
       }
     };
 
-    page.on("request", requestHandler);
-    page.on("response", responseHandler);
+    const observePage = (targetPage: Page) => {
+      if (observedPages.includes(targetPage)) return;
+      targetPage.on("request", requestHandler!);
+      targetPage.on("response", responseHandler!);
+      observedPages.push(targetPage);
+      resolveCapture(targetPage.url());
+    };
 
-    const hasInitialHdOption = await waitForPreferredFormatUi(page, 1500);
-    if (hasInitialHdOption) {
-      const selectedFormat = await selectPreferredDownloadFormat(page, MAX_DOWNLOAD_BYTES);
-      if (!selectedFormat) {
-        return {
-          downloadUrl: "",
-          loggedIn: accountState.loggedInLikely,
-          error: "No supported HD format under 100 MB (HDMP4 or HDMOV)",
-        };
-      }
-      await delay(OPERATION_DELAY_MS);
-      const activeFormat = await getSelectedDownloadFormat(page);
-      if (activeFormat !== "HDMP4" && activeFormat !== "HDMOV") {
-        return {
-          downloadUrl: "",
-          loggedIn: accountState.loggedInLikely,
-          error: `Failed to switch away from ${activeFormat || "default"} format`,
-        };
-      }
-      await delay(OPERATION_DELAY_MS);
+    observePage(page);
+    targetCreatedHandler = (target) => {
+      if (target.type() !== "page") return;
+      void target.page().then((targetPage) => {
+        if (!targetPage) return;
+        observePage(targetPage);
+      }).catch(() => {});
+    };
+    browser.on("targetcreated", targetCreatedHandler);
 
-      const startedDownload = await clickDownloadButton(page, { preferOverlay: true });
-      if (!startedDownload) {
-        return {
-          downloadUrl: "",
-          loggedIn: accountState.loggedInLikely,
-          error: accountState.explicitLoggedOut
-            ? "Not logged in — cookies may be expired or invalid"
-            : "Could not find the Download button on the page",
-        };
+    try {
+      try {
+        await runDownloadFlow(page, accountState, MAX_DOWNLOAD_BYTES);
+      } catch (primaryError) {
+        // Recovery pass for flaky UI states: reload and replay once.
+        await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+        await delay(OPERATION_DELAY_MS);
+        await runDownloadFlow(page, accountState, MAX_DOWNLOAD_BYTES);
+        recentNetworkHints.push(
+          `recovered_after_reload=${primaryError instanceof Error ? primaryError.message.slice(0, 120) : String(primaryError).slice(0, 120)}`
+        );
       }
-    } else {
-      const openedDownloadFlow = await clickDownloadButton(page);
-      if (!openedDownloadFlow) {
-        return {
-          downloadUrl: "",
-          loggedIn: accountState.loggedInLikely,
-          error: accountState.explicitLoggedOut
-            ? "Not logged in — cookies may be expired or invalid"
-            : "Could not find the Download button on the page",
-        };
-      }
-
-      await delay(OPERATION_DELAY_MS);
-
-      const chooserHasFormat = await waitForPreferredFormatUi(page, 2500);
-      if (!chooserHasFormat) {
-        return {
-          downloadUrl: "",
-          loggedIn: accountState.loggedInLikely,
-          error: "No supported HD format under 100 MB (HDMP4 or HDMOV)",
-        };
-      }
-
-      const selectedFormat = await selectPreferredDownloadFormat(page, MAX_DOWNLOAD_BYTES);
-      if (!selectedFormat) {
-        return {
-          downloadUrl: "",
-          loggedIn: accountState.loggedInLikely,
-          error: "No supported HD format under 100 MB (HDMP4 or HDMOV)",
-        };
-      }
-      await delay(OPERATION_DELAY_MS);
-
-      const activeFormat = await getSelectedDownloadFormat(page);
-      if (activeFormat !== "HDMP4" && activeFormat !== "HDMOV") {
-        return {
-          downloadUrl: "",
-          loggedIn: accountState.loggedInLikely,
-          error: `Failed to switch away from ${activeFormat || "default"} format`,
-        };
-      }
-
-      const confirmedDownload = await clickDownloadButton(page, { preferOverlay: true });
-      if (!confirmedDownload) {
-        return {
-          downloadUrl: "",
-          loggedIn: accountState.loggedInLikely,
-          error: accountState.explicitLoggedOut
-            ? "Not logged in — cookies may be expired or invalid"
-            : "Could not confirm the HD download",
-        };
-      }
+    } catch (error) {
+      return {
+        downloadUrl: "",
+        loggedIn: accountState?.loggedInLikely ?? true,
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
 
-    const outcome = await Promise.race([
-      capturePromise.then((capture) => ({ kind: "url" as const, ...capture })),
-      waitForDownloadedFile(downloadDir, existingFiles, DOWNLOAD_TIMEOUT_MS).then((file) =>
-        file ? { kind: "file" as const, ...file } : { kind: "file-timeout" as const }
-      ),
-      delay(CAPTURE_TIMEOUT_MS).then(() => ({ kind: "timeout" as const })),
-    ]);
-
-    if (outcome.kind === "url") {
-      const downloadedFile = await waitForDownloadedFile(downloadDir, existingFiles, 4000);
-      if (downloadedFile) {
-        keepLocalFilePath = downloadedFile.filePath;
+    const effectiveDownloadDir = downloadDir!;
+    const captureResult = await Promise.race([
+      capturePromise.then(async (url) => {
+        const localFileWaitMs = captureTimeoutMs;
+        const localFile = await waitForDownloadedFile(effectiveDownloadDir, existingFiles, localFileWaitMs);
+        if (localFile) {
+          keepLocalFilePath = localFile.filePath;
+          return {
+            downloadUrl: "",
+            localFilePath: localFile.filePath,
+            filename: localFile.filename,
+            loggedIn: true,
+          };
+        }
+        void delay(2000).then(() => cleanupDownloadArtifacts(effectiveDownloadDir));
+        return { downloadUrl: url, loggedIn: true };
+      }),
+      waitForDownloadedFile(effectiveDownloadDir, existingFiles, captureTimeoutMs).then((file) => {
+        if (!file) return null;
+        keepLocalFilePath = file.filePath;
         return {
           downloadUrl: "",
-          localFilePath: downloadedFile.filePath,
-          filename: downloadedFile.filename,
+          localFilePath: file.filePath,
+          filename: file.filename,
           loggedIn: true,
         };
-      }
+      }),
+      delay(captureTimeoutMs).then(() => null),
+    ]);
 
-      if (downloadDir) {
-        void delay(4000).then(() => cleanupDownloadArtifacts(downloadDir));
-      }
-      return {
-        downloadUrl: outcome.url,
-        filename: outcome.filename,
-        loggedIn: true,
-      };
-    }
-
-    if (outcome.kind === "file") {
-      keepLocalFilePath = outcome.filePath;
-      return {
-        downloadUrl: "",
-        localFilePath: outcome.filePath,
-        filename: outcome.filename,
-        loggedIn: true,
-      };
-    }
-
-    const fallbackFile = await waitForDownloadedFile(downloadDir, existingFiles, DOWNLOAD_TIMEOUT_MS);
-    if (fallbackFile) {
-      keepLocalFilePath = fallbackFile.filePath;
-      return {
-        downloadUrl: "",
-        localFilePath: fallbackFile.filePath,
-        filename: fallbackFile.filename,
-        loggedIn: true,
-      };
+    if (captureResult) {
+      return captureResult;
     }
 
     return {
@@ -950,16 +1073,23 @@ async function getDownloadUrlOnce(
       loggedIn: accountState?.loggedInLikely ?? true,
       error: accountState?.explicitLoggedOut
         ? "Not logged in — cookies may be expired or invalid"
-        : "Download flow ran, but no HD video URL or file was captured",
+        : `Download flow ran, but no HD MP4 URL or file was captured within ${Math.ceil(captureTimeoutMs / 1000)}s`,
     };
   } finally {
-    if (page && requestHandler) {
-      page.off("request", requestHandler);
+    if (targetCreatedHandler) {
+      browser.off("targetcreated", targetCreatedHandler);
     }
-    if (page && responseHandler) {
-      page.off("response", responseHandler);
+    if (requestHandler || responseHandler) {
+      for (const observedPage of observedPages) {
+        if (requestHandler) observedPage.off("request", requestHandler);
+        if (responseHandler) observedPage.off("response", responseHandler);
+      }
     }
-    await page?.close().catch(() => {});
+    if (isolatedContext) {
+      await isolatedContext.close().catch(() => {});
+    } else {
+      await page?.close().catch(() => {});
+    }
 
     if (downloadDir && keepLocalFilePath && !keepLocalFilePath.startsWith(downloadDir)) {
       await cleanupDownloadArtifacts(downloadDir);
@@ -970,56 +1100,89 @@ async function getDownloadUrlOnce(
     }
 
     if (ownsBrowser) {
-      await browser.close();
+      await browser.close().catch(() => {});
     }
   }
 }
 
-export async function getDownloadUrl(
+export interface DownloadRetryContext {
+  attempt: number;
+  maxAttempts: number;
+  error: string;
+  errorClass: DownloadErrorClass;
+  backoffMs: number;
+}
+
+export interface DownloadRetryOptions {
+  sharedBrowser?: Browser;
+  maxAttempts?: number;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  captureTimeoutMs?: number;
+  downloadTimeoutMs?: number;
+  loginVerified?: boolean;
+  onRetry?: (context: DownloadRetryContext) => void;
+}
+
+type DownloadResult = Awaited<ReturnType<typeof getDownloadUrl>>;
+
+export async function getDownloadUrlWithRetry(
   detailUrl: string,
   cookies: StoryblocksCookie[],
-  sharedBrowser?: Browser
-): Promise<DownloadLookupResult> {
-  const attempts = sharedBrowser ? 1 : MAX_DOWNLOAD_ATTEMPTS;
-  let lastResult: DownloadLookupResult | undefined;
+  options: DownloadRetryOptions = {}
+): Promise<DownloadResult & { attemptsUsed: number; retriesUsed: number; errorClass?: DownloadErrorClass }> {
+  const maxAttempts = Math.max(1, options.maxAttempts ?? 3);
+  const baseDelayMs = Math.max(100, options.baseDelayMs ?? 700);
+  const maxDelayMs = Math.max(baseDelayMs, options.maxDelayMs ?? 6_000);
 
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    let result: DownloadLookupResult;
+  let attempt = 0;
+  let retriesUsed = 0;
+  let lastResult: DownloadResult | undefined;
 
-    try {
-      result = sharedBrowser
-        ? await getDownloadUrlOnce(detailUrl, cookies, sharedBrowser)
-        : await Promise.race<DownloadLookupResult>([
-            getDownloadUrlOnce(detailUrl, cookies),
-            delay(DOWNLOAD_ATTEMPT_TIMEOUT_MS).then(() => ({
-              downloadUrl: "",
-              error: `Download attempt timed out after ${Math.round(DOWNLOAD_ATTEMPT_TIMEOUT_MS / 1000)} seconds`,
-            })),
-          ]);
-    } catch (err) {
-      result = {
-        downloadUrl: "",
-        error: err instanceof Error ? err.message : String(err),
-      };
-    }
-
+  while (attempt < maxAttempts) {
+    attempt += 1;
+    const result = await getDownloadUrl(detailUrl, cookies, {
+      sharedBrowser: options.sharedBrowser,
+      captureTimeoutMs: options.captureTimeoutMs,
+      downloadTimeoutMs: options.downloadTimeoutMs,
+      loginVerified: options.loginVerified,
+    });
     lastResult = result;
 
     if (!result.error) {
-      return result;
+      return {
+        ...result,
+        attemptsUsed: attempt,
+        retriesUsed,
+      };
     }
 
-    if (attempt >= attempts || !isRetryableDownloadError(result.error)) {
-      return result;
+    const errorClass = classifyDownloadError(result.error);
+    if (errorClass === "terminal" || attempt >= maxAttempts) {
+      return {
+        ...result,
+        attemptsUsed: attempt,
+        retriesUsed,
+        errorClass,
+      };
     }
 
-    await delay(1000);
+    const backoffMs = computeBackoffMs(attempt, baseDelayMs, maxDelayMs);
+    retriesUsed += 1;
+    options.onRetry?.({
+      attempt,
+      maxAttempts,
+      error: result.error,
+      errorClass,
+      backoffMs,
+    });
+    await delay(backoffMs);
   }
 
-  return (
-    lastResult ?? {
-      downloadUrl: "",
-      error: "Download failed",
-    }
-  );
+  return {
+    ...(lastResult ?? { downloadUrl: "", error: "Unknown retry failure" }),
+    attemptsUsed: attempt,
+    retriesUsed,
+    errorClass: "terminal",
+  };
 }
