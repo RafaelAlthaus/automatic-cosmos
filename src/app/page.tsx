@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useMemo, useEffect } from "react";
 import type {
   DownloadBatchEvent,
   DownloadBatchInputVideo,
@@ -34,7 +34,8 @@ type DownloadCheckpoint = {
   updatedAt: number;
 };
 
-const DOWNLOAD_CHECKPOINT_KEY = "automatic-cosmos.download-checkpoint.v1";
+const DOWNLOAD_CHECKPOINT_BASE_KEY = "automatic-cosmos.download-checkpoint.v1";
+const generateSessionId = () => String.fromCharCode(65 + Math.floor(Math.random() * 26));
 const CLIENT_DOWNLOAD_CONCURRENCY: Record<DownloadProfileName, number> = {
   fast: 10,
   balanced: 6,
@@ -73,6 +74,14 @@ export default function Home() {
   const [downloadProfile, setDownloadProfile] = useState<DownloadProfileName>("balanced");
   const [stopOnCriticalError, setStopOnCriticalError] = useState(true);
   const [reScrapingIndex, setReScrapingIndex] = useState<number | null>(null);
+  const [sessionPrefix, setSessionPrefix] = useState("A");
+  const [mounted, setMounted] = useState(false);
+  const checkpointKey = useMemo(() => `${DOWNLOAD_CHECKPOINT_BASE_KEY}.${sessionPrefix}`, [sessionPrefix]);
+
+  useEffect(() => {
+    setSessionPrefix(generateSessionId());
+    setMounted(true);
+  }, []);
   const [downloadAllProgress, setDownloadAllProgress] = useState<{ done: number; total: number } | null>(null);
   const [batchSummary, setBatchSummary] = useState<DownloadBatchSummary | null>(null);
   const [orderAudit, setOrderAudit] = useState<{ lastSequence: number; violations: number }>({
@@ -352,7 +361,7 @@ export default function Home() {
       const allResultVideos = results[i]?.videos ?? [];
       return slots.map((slot, slotIndex) => {
         sequenceCounter += 1;
-        const suggestedFilename = `${String(sequenceCounter).padStart(4, "0")}.mp4`;
+        const suggestedFilename = `${sessionPrefix}-${String(sequenceCounter).padStart(4, "0")}.mp4`;
         const replacements: ReplacementCandidate[] = allResultVideos
           .map((v, idx) => ({ detailUrl: v.detailUrl, title: v.title, originalIndex: idx }))
           .filter((r) => !usedIndexes.has(r.originalIndex) && r.originalIndex !== slot.originalIndex);
@@ -381,7 +390,7 @@ export default function Home() {
     const signature = createBatchSignature(allVideos, downloadProfile);
     let resumeIndex = 0;
     try {
-      const raw = localStorage.getItem(DOWNLOAD_CHECKPOINT_KEY);
+      const raw = localStorage.getItem(checkpointKey);
       if (raw) {
         const checkpoint = JSON.parse(raw) as DownloadCheckpoint;
         const isMatchingRun =
@@ -396,12 +405,12 @@ export default function Home() {
           if (shouldResume) {
             resumeIndex = checkpoint.nextIndex;
           } else {
-            localStorage.removeItem(DOWNLOAD_CHECKPOINT_KEY);
+            localStorage.removeItem(checkpointKey);
           }
         }
       }
     } catch {
-      localStorage.removeItem(DOWNLOAD_CHECKPOINT_KEY);
+      localStorage.removeItem(checkpointKey);
     }
 
     const persistCheckpoint = (nextIndex: number) => {
@@ -411,7 +420,7 @@ export default function Home() {
         nextIndex,
         updatedAt: Date.now(),
       };
-      localStorage.setItem(DOWNLOAD_CHECKPOINT_KEY, JSON.stringify(checkpoint));
+      localStorage.setItem(checkpointKey, JSON.stringify(checkpoint));
     };
 
     persistCheckpoint(resumeIndex);
@@ -419,7 +428,7 @@ export default function Home() {
     const queuedVideos = allVideos.slice(resumeIndex);
     if (queuedVideos.length === 0) {
       setDownloadAllProgress({ done: allVideos.length, total: allVideos.length });
-      localStorage.removeItem(DOWNLOAD_CHECKPOINT_KEY);
+      localStorage.removeItem(checkpointKey);
       return;
     }
 
@@ -653,7 +662,7 @@ export default function Home() {
     setDownloadingAll(false);
     setDownloadAllProgress(null);
     if (done >= allVideos.length) {
-      localStorage.removeItem(DOWNLOAD_CHECKPOINT_KEY);
+      localStorage.removeItem(checkpointKey);
     }
   }, [
     autoSelectedSlots,
@@ -663,6 +672,8 @@ export default function Home() {
     downloadProfile,
     stopOnCriticalError,
     toDownloadFilename,
+    sessionPrefix,
+    checkpointKey,
   ]);
 
   const currentResult = results[currentIndex];
@@ -679,7 +690,14 @@ export default function Home() {
     <div className="min-h-screen bg-zinc-950 text-zinc-100">
       <header className="border-b border-zinc-800 px-6 py-4">
         <div className="max-w-6xl mx-auto flex items-center justify-between">
-          <h1 className="text-xl font-semibold">Storyblocks Video Scraper</h1>
+          <div className="flex items-center gap-3">
+            <h1 className="text-xl font-semibold">Storyblocks Video Scraper</h1>
+            {mounted && (
+              <span className="text-xs font-mono bg-zinc-800 text-zinc-400 px-2 py-0.5 rounded">
+                Session {sessionPrefix}
+              </span>
+            )}
+          </div>
           {results.length > 0 && (
             <button onClick={() => setShowConfig((prev) => !prev)} className="text-sm text-zinc-400 hover:text-zinc-200 transition">
               {showConfig ? "Hide Config" : "Show Config"}
@@ -743,6 +761,20 @@ export default function Home() {
                     className="w-16 bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-1.5 text-sm text-zinc-300 focus:outline-none focus:border-zinc-500" />
                 </div>
               )}
+            </div>
+            <div className="flex items-end gap-4 flex-wrap">
+              <div className="flex-1 min-w-[180px]">
+                <label className="block text-sm text-zinc-400 mb-1">Session prefix</label>
+                <input
+                  type="text"
+                  value={sessionPrefix}
+                  onChange={(e) => setSessionPrefix(e.target.value.replace(/[^a-zA-Z0-9]/g, "").slice(0, 6).toUpperCase() || "A")}
+                  className="w-24 bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm font-mono text-zinc-300 focus:outline-none focus:border-zinc-500"
+                />
+                <p className="text-xs text-zinc-500 mt-1">
+                  Files: {sessionPrefix}-0001.mp4, {sessionPrefix}-0002.mp4, ...
+                </p>
+              </div>
             </div>
             <div>
               <label className="block text-sm text-zinc-400 mb-1">Download profile</label>
