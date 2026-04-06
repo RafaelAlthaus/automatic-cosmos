@@ -649,6 +649,28 @@ async function cleanupDownloadArtifacts(targetPath?: string) {
   await rm(targetPath, { recursive: true, force: true }).catch(() => {});
 }
 
+async function waitForSearchCards(page: Page, timeoutMs: number) {
+  return page
+    .waitForFunction(() => {
+      const pageText = (document.body.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const candidateLinks = Array.from(document.querySelectorAll("a[href*='/video/stock/']")).filter((el) => {
+        if (el.closest("header") || el.closest("nav") || el.closest("footer")) return false;
+        const href = el.getAttribute("href") || "";
+        return href.includes("/video/stock/");
+      });
+
+      return (
+        candidateLinks.length > 0 ||
+        pageText.includes("no results") ||
+        pageText.includes("0 results") ||
+        pageText.includes("did not match any results") ||
+        pageText.includes("we couldn't find")
+      );
+    }, { timeout: timeoutMs })
+    .then(() => true)
+    .catch(() => false);
+}
+
 async function scrapeSingleSearchUrl(
   browser: Browser,
   url: string,
@@ -664,28 +686,58 @@ async function scrapeSingleSearchUrl(
     onProgress?.({ type: "progress", message: `Opening URL ${position}/${total}: ${url}` });
 
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await delay(OPERATION_DELAY_MS);
 
-    await page.waitForSelector('[class*="image-link"], [data-testid*="video"], a[href*="/video/"]', {
-      timeout: 10000,
-    });
+    let cardsReady = await waitForSearchCards(page, 12000);
+    if (!cardsReady) {
+      await page.reload({ waitUntil: "networkidle2", timeout: 30000 }).catch(() => null);
+      await delay(OPERATION_DELAY_MS);
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight * 0.25)).catch(() => null);
+      await delay(350);
+      cardsReady = await waitForSearchCards(page, 8000);
+    }
+
+    if (!cardsReady) {
+      throw new Error("Could not find Storyblocks result cards on the search page");
+    }
 
     const videoCards = await page.evaluate(() => {
-      let cards = Array.from(document.querySelectorAll("a.image-link"));
-      if (cards.length === 0) cards = Array.from(document.querySelectorAll('a[href*="/video/stock/"]'));
-      if (cards.length === 0) cards = Array.from(document.querySelectorAll('[data-testid*="video"] a'));
+      const textOf = (el: Element | null | undefined) => (el?.textContent || "").replace(/\s+/g, " ").trim();
+      const getCardRoot = (anchor: Element) =>
+        anchor.closest("article, li, [data-testid*='video'], [class*='card'], [class*='tile'], [class*='result']") ||
+        anchor.parentElement ||
+        anchor;
 
-      return cards.slice(0, 12).map((card) => {
+      const cards = Array.from(document.querySelectorAll("a[href*='/video/stock/']")).filter((el) => {
+        if (el.closest("header") || el.closest("nav") || el.closest("footer")) return false;
+        const href = el.getAttribute("href") || "";
+        return href.includes("/video/stock/");
+      });
+
+      const dedupedCards = cards.filter((card, index, list) => {
+        const href = card.getAttribute("href") || "";
+        return href && list.findIndex((other) => (other.getAttribute("href") || "") === href) === index;
+      });
+
+      return dedupedCards.slice(0, 12).map((card) => {
         const anchor = card.closest("a") || card;
-        const videoEl = card.querySelector("video");
+        const cardRoot = getCardRoot(anchor);
+        const videoEl = cardRoot.querySelector("video");
         const sourceEl = videoEl?.querySelector("source");
+        const title =
+          anchor.getAttribute("aria-label") ||
+          anchor.querySelector("img")?.getAttribute("alt") ||
+          cardRoot.querySelector("h1, h2, h3, h4, [data-testid*='title']")?.textContent ||
+          textOf(anchor) ||
+          textOf(cardRoot);
         return {
-          title: (anchor.getAttribute("aria-label") || anchor.textContent || "")
+          title: (title || "")
             .replace(/^Go to video details for\s*/i, "")
             .trim()
             .slice(0, 100),
           detailUrl: anchor.getAttribute("href") || "",
           thumbnail:
-            videoEl?.getAttribute("poster") || card.querySelector("img")?.getAttribute("src") || "",
+            videoEl?.getAttribute("poster") || cardRoot.querySelector("img")?.getAttribute("src") || "",
           previewVideoUrl:
             videoEl?.getAttribute("src") ||
             sourceEl?.getAttribute("src") ||
@@ -701,6 +753,22 @@ async function scrapeSingleSearchUrl(
       message: `Found ${videoCards.length} cards on URL ${position}, extracting video previews...`,
     });
 
+    if (videoCards.length === 0) {
+      const isEmptyState = await page.evaluate(() => {
+        const pageText = (document.body.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+        return (
+          pageText.includes("no results") ||
+          pageText.includes("0 results") ||
+          pageText.includes("did not match any results") ||
+          pageText.includes("we couldn't find")
+        );
+      });
+
+      if (!isEmptyState) {
+        throw new Error("Search page loaded, but no Storyblocks result cards were extracted");
+      }
+    }
+
     const videos: VideoInfo[] = [...videoCards];
     const needsHover = videos.some((video) => !video.previewVideoUrl);
 
@@ -712,7 +780,10 @@ async function scrapeSingleSearchUrl(
           return v.getAttribute("src") || v.querySelector("source")?.getAttribute("src") || (v as HTMLVideoElement).currentSrc || "";
         };
 
-        const cards = Array.from(document.querySelectorAll("a.image-link, a[href*='/video/stock/']")).slice(0, 12);
+        const cards = Array.from(document.querySelectorAll("a[href*='/video/stock/']")).filter((el) => {
+          if (el.closest("header") || el.closest("nav") || el.closest("footer")) return false;
+          return (el.getAttribute("href") || "").includes("/video/stock/");
+        }).slice(0, 12);
 
         for (const card of cards) {
           card.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
