@@ -304,10 +304,10 @@ export default function Home() {
   }, [results, cookiesJson, videosPerLink]);
 
   const handleDownload = useCallback(
-    async (detailUrl: string, searchUrl: string, title: string) => {
+    async (detailUrl: string, searchUrl: string, title: string, forcedFilename?: string) => {
       setDownloading(detailUrl);
       try {
-        await downloadVideoFromDetail(detailUrl, title);
+        await downloadVideoFromDetail(detailUrl, title, forcedFilename);
       } catch (err) {
         setDownloadErrors((prev) => [...prev, { videoUrl: detailUrl, searchUrl, error: err instanceof Error ? err.message : String(err), kind: "failure" }]);
       } finally {
@@ -1102,7 +1102,7 @@ export default function Home() {
                           <button
                             onClick={() => {
                               setDownloadErrors((prev) => prev.filter((_, idx) => idx !== downloadErrors.indexOf(err)));
-                              handleDownload(err.videoUrl, err.searchUrl, err.title || "video");
+                              handleDownload(err.videoUrl, err.searchUrl, err.title || "video", err.suggestedFilename);
                             }}
                             disabled={downloading === err.videoUrl}
                             className="text-xs px-2.5 py-1 bg-blue-700 hover:bg-blue-600 disabled:bg-zinc-700 disabled:text-zinc-500 text-white rounded-md transition"
