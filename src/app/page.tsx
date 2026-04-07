@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useCallback, useMemo, useEffect } from "react";
+import Link from "next/link";
 import type {
   DownloadBatchEvent,
   DownloadBatchInputVideo,
@@ -698,11 +699,16 @@ export default function Home() {
               </span>
             )}
           </div>
-          {results.length > 0 && (
-            <button onClick={() => setShowConfig((prev) => !prev)} className="text-sm text-zinc-400 hover:text-zinc-200 transition">
-              {showConfig ? "Hide Config" : "Show Config"}
-            </button>
-          )}
+          <div className="flex items-center gap-4">
+            <Link href="/srt-images" className="text-sm text-zinc-400 hover:text-zinc-200 transition">
+              SRT → Images
+            </Link>
+            {results.length > 0 && (
+              <button onClick={() => setShowConfig((prev) => !prev)} className="text-sm text-zinc-400 hover:text-zinc-200 transition">
+                {showConfig ? "Hide Config" : "Show Config"}
+              </button>
+            )}
+          </div>
         </div>
       </header>
 
