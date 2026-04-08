@@ -152,7 +152,7 @@ const STYLE_PRESETS: { key: string; label: string; style: string }[] = [
   {
     key: "jesus",
     label: "Jesus Style",
-    style: "The style of this image is a hyper-detailed, modern digital illustration that emulates and reinterprets Classical Renaissance and Baroque religious painting. It combines the rich, saturated color palette (deep reds, ochres, golds) and dramatic chiaroscuro lighting of old masters with a very polished, clean, and highly defined digital execution. The brushwork, though digital, mimics the texture of old paint on a textured surface. The composition is formal and hierarchical, with a strong focus on dramatic light sources and a reverent tone.",
+    style: "The style of this image is a hyper-detailed, modern digital illustration that emulates and reinterprets Classical Renaissance and Baroque religious painting. It combines the rich, saturated color palette (deep reds, ochres, golds) and dramatic chiaroscuro lighting of old masters with a very polished, clean, and highly defined digital execution. The brushwork, though digital, mimics the texture of old paint on a textured surface. The composition is formal and hierarchical, with a strong focus on dramatic light sources and a reverent tone. Lighting is exclusively warm — oil lamps, candles, and torches casting orange-amber glow. No cool, blue, or daylight tones anywhere in the image. The palette is always warm: deep burgundy reds, burnt ochres, golden ambers, dark earthy browns. Never cold, never desaturated.",
   },
   {
     key: "doctors",
