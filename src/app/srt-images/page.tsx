@@ -71,8 +71,8 @@ function groupIntoSegments(entries: SrtEntry[], targetSeconds: number): Segment[
 
 // ─── Cost helpers ─────────────────────────────────────────────────────────────
 
-const PRICE_INPUT_PER_1M = 0.05;
-const PRICE_OUTPUT_PER_1M = 0.40;
+const PRICE_INPUT_PER_1M = 1.10;
+const PRICE_OUTPUT_PER_1M = 4.40;
 
 function calcCost(usage: UsageSummary) {
   const input = (usage.prompt_tokens / 1_000_000) * PRICE_INPUT_PER_1M;
@@ -148,10 +148,20 @@ function triggerDownload(blob: Blob, filename: string) {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const DEFAULT_STYLE =
-  "The style of this image is a hyper-detailed, modern digital illustration that emulates and reinterprets Classical Renaissance and Baroque religious painting. It combines the rich, saturated color palette (deep reds, ochres, golds) and dramatic chiaroscuro lighting of old masters with a very polished, clean, and highly defined digital execution. The brushwork, though digital, mimics the texture of old paint on a textured surface. The composition is formal and hierarchical, with a strong focus on dramatic light sources and a reverent tone.";
+const STYLE_PRESETS: { key: string; label: string; style: string }[] = [
+  {
+    key: "jesus",
+    label: "Jesus Style",
+    style: "The style of this image is a hyper-detailed, modern digital illustration that emulates and reinterprets Classical Renaissance and Baroque religious painting. It combines the rich, saturated color palette (deep reds, ochres, golds) and dramatic chiaroscuro lighting of old masters with a very polished, clean, and highly defined digital execution. The brushwork, though digital, mimics the texture of old paint on a textured surface. The composition is formal and hierarchical, with a strong focus on dramatic light sources and a reverent tone.",
+  },
+  {
+    key: "doctors",
+    label: "Doctors Office",
+    style: "Photorealistic medical documentary style. Clean, modern environments with soft, diffused lighting. The color palette is very diverse and colorful. The overall composition is clear, professional, and reassuring — suitable for broadcast health education content.",
+  },
+];
 
-const BATCH_SIZE = 10;
+const BATCH_SIZE = 20;
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
@@ -160,7 +170,7 @@ export default function SrtImagesPage() {
 
   // Step 1
   const [targetSeconds, setTargetSeconds] = useState(15);
-  const [imageStyle, setImageStyle] = useState(DEFAULT_STYLE);
+  const [imageStyle, setImageStyle] = useState("");
   const [aspectRatio, setAspectRatio] = useState<AspectRatio>("16:9");
   const [imageModel, setImageModel] = useState<ImageModelId>("sourceful/riverflow-v2-fast");
   const [srtEntries, setSrtEntries] = useState<SrtEntry[]>([]);
@@ -189,11 +199,11 @@ export default function SrtImagesPage() {
   // Step 4 – image generation
   const [generatedImages, setGeneratedImages] = useState<(string | null)[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [generatingOneIndex, setGeneratingOneIndex] = useState<number | null>(null);
+  const [generatingIndices, setGeneratingIndices] = useState<number[]>([]);
+  const [rewritingIndices, setRewritingIndices] = useState<number[]>([]);
   const [generationProgress, setGenerationProgress] = useState({ done: 0, total: 0 });
   const [imageLogs, setImageLogs] = useState<string[]>([]);
-  const imageLogsEndRef = useRef<HTMLDivElement>(null);
-  const [rewritingIndex, setRewritingIndex] = useState<number | null>(null);
+  const imageLogsContainerRef = useRef<HTMLDivElement>(null);
 
   const [hasRestoredSession, setHasRestoredSession] = useState(false);
 
@@ -204,7 +214,8 @@ export default function SrtImagesPage() {
   }, []);
 
   useEffect(() => {
-    imageLogsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const container = imageLogsContainerRef.current;
+    if (container) container.scrollTop = container.scrollHeight;
   }, [imageLogs]);
 
   // ── localStorage: restore on mount ──────────────────────────────
@@ -265,7 +276,7 @@ export default function SrtImagesPage() {
     setImageLogs([]);
     setGenerationProgress({ done: 0, total: 0 });
     setHasRestoredSession(false);
-    setImageStyle(DEFAULT_STYLE);
+    setImageStyle("");
     setTargetSeconds(15);
     setAspectRatio("16:9");
     setImageModel("sourceful/riverflow-v2-fast");
@@ -458,60 +469,51 @@ export default function SrtImagesPage() {
   }, [imageStyle, descriptions, aspectRatio, imageModel]);
 
   const handleGenerateOne = useCallback(async (index: number) => {
-    setGeneratingOneIndex(index);
+    setGeneratingIndices((prev) => [...prev, index]);
     try {
       await generateOne(index, addImageLog);
     } catch (err) {
       const num = String(index + 1).padStart(3, "0");
       addImageLog(`Image ${num} ✗ failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
-      setGeneratingOneIndex(null);
+      setGeneratingIndices((prev) => prev.filter((i) => i !== index));
     }
   }, [generateOne, addImageLog]);
 
-  // ── Step 4: generate all in sequential batches of 5 ─────────────
+  // ── Step 4: generate all with a sliding concurrency window of 12 ──
   const handleGenerateAll = useCallback(async () => {
     setIsGenerating(true);
     setImageLogs([]);
     const total = descriptions.length;
     setGenerationProgress({ done: 0, total });
 
-    const IMAGE_BATCH_SIZE = 5;
-    const totalBatches = Math.ceil(total / IMAGE_BATCH_SIZE);
+    const CONCURRENCY = 12;
     let succeeded = 0;
     let failed = 0;
+    let nextIndex = 0;
 
-    addImageLog(`Starting ${total} images in ${totalBatches} batch${totalBatches !== 1 ? "es" : ""} of ${IMAGE_BATCH_SIZE}`);
+    addImageLog(`Starting ${total} images with concurrency ${CONCURRENCY}`);
 
-    for (let batchStart = 0; batchStart < total; batchStart += IMAGE_BATCH_SIZE) {
-      const batchNum = Math.floor(batchStart / IMAGE_BATCH_SIZE) + 1;
-      const batchIndices = Array.from(
-        { length: Math.min(IMAGE_BATCH_SIZE, total - batchStart) },
-        (_, i) => batchStart + i
-      );
-      const first = String(batchIndices[0] + 1).padStart(3, "0");
-      const last  = String(batchIndices[batchIndices.length - 1] + 1).padStart(3, "0");
-      addImageLog(`Batch ${batchNum}/${totalBatches} (images ${first}–${last}) → started`);
-      const batchT0 = Date.now();
+    const runWorker = async () => {
+      while (true) {
+        const index = nextIndex++;
+        if (index >= total) break;
+        setGeneratingIndices((prev) => [...prev, index]);
+        try {
+          await generateOne(index, addImageLog);
+          succeeded++;
+        } catch (err) {
+          failed++;
+          const num = String(index + 1).padStart(3, "0");
+          addImageLog(`Image ${num} ✗ failed: ${err instanceof Error ? err.message : String(err)}`);
+        } finally {
+          setGeneratingIndices((prev) => prev.filter((i) => i !== index));
+          setGenerationProgress((prev) => ({ ...prev, done: prev.done + 1 }));
+        }
+      }
+    };
 
-      await Promise.all(
-        batchIndices.map(async (index) => {
-          try {
-            await generateOne(index, addImageLog);
-            succeeded++;
-          } catch (err) {
-            failed++;
-            const num = String(index + 1).padStart(3, "0");
-            addImageLog(`Image ${num} ✗ failed: ${err instanceof Error ? err.message : String(err)}`);
-          } finally {
-            setGenerationProgress((prev) => ({ ...prev, done: prev.done + 1 }));
-          }
-        })
-      );
-
-      const batchElapsed = ((Date.now() - batchT0) / 1000).toFixed(1);
-      addImageLog(`Batch ${batchNum}/${totalBatches} ✓ done in ${batchElapsed}s`);
-    }
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, total) }, runWorker));
 
     addImageLog(`Complete — ${succeeded} succeeded${failed > 0 ? `, ${failed} failed` : ""}`);
     setIsGenerating(false);
@@ -519,31 +521,31 @@ export default function SrtImagesPage() {
 
   // ── Step 4: rewrite description then regenerate image ───────────
   const handleRewriteAndRegenerate = useCallback(async (index: number) => {
-    setRewritingIndex(index);
+    setRewritingIndices((prev) => [...prev, index]);
     const num = String(index + 1).padStart(3, "0");
-    addImageLog(`Image ${num} — rewriting prompt for moderation…`);
+    addImageLog(`Image ${num} — regenerating description…`);
+    const systemPrompt = `${videoContext}\n\nImage style: ${imageStyle}`;
     try {
       const res = await fetch("/api/generate-descriptions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          action: "rewrite",
-          description: descriptions[index].description,
-          segment: descriptions[index].segment,
+          action: "describe-batch",
+          batch: [descriptions[index].segment],
+          batchIndex: 0,
+          imageStyle: systemPrompt,
+          cast: videoCast,
         }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Rewrite failed");
+      if (!res.ok) throw new Error(data.error ?? "Description failed");
 
-      const newDesc = data.description as string;
-      addImageLog(`Image ${num} — new prompt ready, generating…`);
+      const newDesc = (data.descriptions as string[])[0] ?? "";
+      addImageLog(`Image ${num} — new description ready, generating image…`);
 
-      // Update description in state so the card shows the new prompt
       setDescriptions((prev) => prev.map((d, i) => i === index ? { ...d, description: newDesc } : d));
 
-      // Generate image with new description (generateOne reads from descriptions state,
-      // so we pass the prompt directly to avoid a stale closure)
-      const prompt = `${imageStyle} The scene: ${newDesc} Rendered as reverent sacred fine art. Museum-quality Renaissance painting style. Fully clothed figures. Dignified and formal composition.`;
+      const prompt = `${imageStyle} The scene: ${newDesc}`;
       const imgRes = await fetch("/api/generate-images", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -553,15 +555,14 @@ export default function SrtImagesPage() {
       if (!imgRes.ok) throw new Error(imgData.error ?? `HTTP ${imgRes.status}`);
       if (imgData.imageUrl) {
         setGeneratedImages((prev) => { const next = [...prev]; next[index] = imgData.imageUrl; return next; });
-        addImageLog(`Image ${num} ✓ generated with new prompt`);
+        addImageLog(`Image ${num} ✓ done`);
       }
     } catch (err) {
-      const num2 = String(index + 1).padStart(3, "0");
-      addImageLog(`Image ${num2} ✗ rewrite failed: ${err instanceof Error ? err.message : String(err)}`);
+      addImageLog(`Image ${num} ✗ failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
-      setRewritingIndex(null);
+      setRewritingIndices((prev) => prev.filter((i) => i !== index));
     }
-  }, [descriptions, imageStyle, aspectRatio, imageModel, addImageLog]);
+  }, [descriptions, videoContext, imageStyle, videoCast, aspectRatio, imageModel, addImageLog]);
 
   // ── Step 4: download one image as JPEG ──────────────────────────
   const downloadImage = useCallback(async (index: number) => {
@@ -583,10 +584,16 @@ export default function SrtImagesPage() {
     }, "image/jpeg", 0.92);
   }, [generatedImages]);
 
-  // ── Step 4: download all generated images ───────────────────────
+  // ── Step 4: download all generated images in batches ───────────
   const downloadAll = useCallback(async () => {
-    for (let i = 0; i < generatedImages.length; i++) {
-      if (generatedImages[i]) await downloadImage(i);
+    const indices = generatedImages.map((url, i) => url ? i : -1).filter((i) => i >= 0);
+    const DOWNLOAD_BATCH = 5;
+    for (let start = 0; start < indices.length; start += DOWNLOAD_BATCH) {
+      const batch = indices.slice(start, start + DOWNLOAD_BATCH);
+      await Promise.all(batch.map((i) => downloadImage(i)));
+      if (start + DOWNLOAD_BATCH < indices.length) {
+        await new Promise((res) => setTimeout(res, 1000));
+      }
     }
   }, [generatedImages, downloadImage]);
 
@@ -641,55 +648,69 @@ export default function SrtImagesPage() {
               <input ref={fileInputRef} type="file" accept=".srt,.txt" className="hidden" onChange={handleFileChange} />
             </div>
 
-            <div className="flex flex-wrap gap-6">
-              <div className="flex items-center gap-3">
-                <label className="text-sm text-zinc-400 whitespace-nowrap">Seconds per segment</label>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div className="space-y-1">
+                <label className="block text-sm text-zinc-400">Seconds per segment</label>
                 <input
-                  type="number" min={5} max={60} value={targetSeconds}
-                  onChange={(e) => setTargetSeconds(Math.max(5, Math.min(60, parseInt(e.target.value) || 15)))}
-                  className="w-20 bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-300 focus:outline-none focus:border-zinc-500"
+                  type="number" min={1} max={60} value={targetSeconds}
+                  onChange={(e) => setTargetSeconds(Math.max(1, Math.min(60, parseInt(e.target.value) || 15)))}
+                  className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-300 focus:outline-none focus:border-zinc-500"
                 />
               </div>
-              <div className="flex items-center gap-3">
-                <label className="text-sm text-zinc-400 whitespace-nowrap">Aspect ratio</label>
+              <div className="space-y-1">
+                <label className="block text-sm text-zinc-400">Aspect ratio</label>
                 <select
                   value={aspectRatio}
                   onChange={(e) => setAspectRatio(e.target.value as AspectRatio)}
-                  className="bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-300 focus:outline-none focus:border-zinc-500"
+                  className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-300 focus:outline-none focus:border-zinc-500"
                 >
                   {ASPECT_RATIO_OPTIONS.map((o) => (
                     <option key={o.value} value={o.value}>{o.label}</option>
                   ))}
                 </select>
               </div>
-              <div className="flex items-start gap-3">
-                <label className="text-sm text-zinc-400 whitespace-nowrap mt-2">Image model</label>
-                <div className="flex flex-col gap-1">
-                  <select
-                    value={imageModel}
-                    onChange={(e) => setImageModel(e.target.value as ImageModelId)}
-                    className="bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-300 focus:outline-none focus:border-zinc-500"
-                  >
-                    {IMAGE_MODEL_OPTIONS.map((o) => (
-                      <option key={o.value} value={o.value}>{o.label}</option>
-                    ))}
-                  </select>
-                  <p className="text-xs text-zinc-500">
-                    {IMAGE_MODEL_OPTIONS.find((o) => o.value === imageModel)?.note}
-                  </p>
-                </div>
+              <div className="space-y-1">
+                <label className="block text-sm text-zinc-400">Image model</label>
+                <select
+                  value={imageModel}
+                  onChange={(e) => setImageModel(e.target.value as ImageModelId)}
+                  className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-300 focus:outline-none focus:border-zinc-500"
+                >
+                  {IMAGE_MODEL_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
+                </select>
+                <p className="text-xs text-zinc-500">
+                  {IMAGE_MODEL_OPTIONS.find((o) => o.value === imageModel)?.note}
+                </p>
               </div>
             </div>
 
-            <div>
-              <label className="block text-sm text-zinc-400 mb-2">Default image style</label>
+            <div className="space-y-2">
+              <div className="flex items-center gap-3">
+                <label className="text-sm text-zinc-400">Image style</label>
+                <select
+                  onChange={(e) => {
+                    const preset = STYLE_PRESETS.find((p) => p.key === e.target.value);
+                    if (preset) setImageStyle(preset.style);
+                    e.target.value = "";
+                  }}
+                  defaultValue=""
+                  className="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-sm text-zinc-300 focus:outline-none focus:border-zinc-500"
+                >
+                  <option value="" disabled>Load preset…</option>
+                  {STYLE_PRESETS.map((p) => (
+                    <option key={p.key} value={p.key}>{p.label}</option>
+                  ))}
+                </select>
+              </div>
               <textarea
                 value={imageStyle}
                 onChange={(e) => setImageStyle(e.target.value)}
                 rows={5}
                 className="w-full bg-zinc-950 border border-zinc-700 rounded-lg p-3 text-sm text-zinc-300 focus:outline-none focus:border-zinc-500 resize-y"
               />
-              <p className="text-xs text-zinc-500 mt-1">
+              <p className="text-xs text-zinc-500">
                 Prepended to every image prompt as: <em>"[style] The scene: [description]"</em>
               </p>
             </div>
@@ -880,7 +901,7 @@ export default function SrtImagesPage() {
               <div className="flex items-center gap-2">
                 <button
                   onClick={handleGenerateAll}
-                  disabled={isGenerating || generatingOneIndex !== null}
+                  disabled={isGenerating}
                   className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-700 disabled:text-zinc-500 text-white rounded-lg text-sm font-medium transition"
                 >
                   {isGenerating
@@ -908,7 +929,7 @@ export default function SrtImagesPage() {
                     />
                   </div>
                 )}
-                <div className="bg-zinc-950 rounded-lg border border-zinc-800 p-3 h-44 overflow-y-auto font-mono text-xs space-y-1">
+                <div ref={imageLogsContainerRef} className="bg-zinc-950 rounded-lg border border-zinc-800 p-3 h-44 overflow-y-auto font-mono text-xs space-y-1">
                   {imageLogs.length === 0 && <p className="text-zinc-600">Waiting…</p>}
                   {imageLogs.map((line, i) => (
                     <p key={i} className={
@@ -920,7 +941,6 @@ export default function SrtImagesPage() {
                       : "text-zinc-400"
                     }>{line}</p>
                   ))}
-                  <div ref={imageLogsEndRef} />
                 </div>
               </div>
             )}
@@ -929,7 +949,9 @@ export default function SrtImagesPage() {
               {descriptions.map((d, i) => {
                 const num = String(i + 1).padStart(3, "0");
                 const imageUrl = generatedImages[i] ?? null;
-                const isThisGenerating = isGenerating || generatingOneIndex === i;
+                const isThisGenerating = generatingIndices.includes(i) || (isGenerating && !imageUrl);
+                const isThisRewriting = rewritingIndices.includes(i);
+                const isThisBusy = isThisGenerating || isThisRewriting;
                 return (
                   <div key={i} className="bg-zinc-950 rounded-xl p-3 border border-zinc-800 flex flex-col gap-2">
                     {/* Image slot */}
@@ -940,13 +962,12 @@ export default function SrtImagesPage() {
                       {imageUrl ? (
                         // eslint-disable-next-line @next/next/no-img-element
                         <img src={imageUrl} alt={`Image ${num}`} className="w-full h-full object-cover" />
-                      ) : isThisGenerating ? (
+                      ) : isThisBusy ? (
                         <Spinner />
                       ) : (
                         <button
                           onClick={() => handleGenerateOne(i)}
-                          disabled={isGenerating || generatingOneIndex !== null}
-                          className="text-zinc-500 hover:text-zinc-300 disabled:opacity-40 text-xs transition flex flex-col items-center gap-1"
+                          className="text-zinc-500 hover:text-zinc-300 text-xs transition flex flex-col items-center gap-1"
                         >
                           <span className="text-lg">+</span>
                           <span>Generate</span>
@@ -961,7 +982,7 @@ export default function SrtImagesPage() {
                         {imageUrl && (
                           <button
                             onClick={() => handleGenerateOne(i)}
-                            disabled={isGenerating || generatingOneIndex !== null || rewritingIndex !== null}
+                            disabled={isThisBusy}
                             title="Re-generate with same prompt"
                             className="text-xs px-1.5 py-1 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 text-zinc-400 rounded transition"
                           >↺</button>
@@ -970,15 +991,15 @@ export default function SrtImagesPage() {
                       <div className="flex items-center gap-1">
                         <button
                           onClick={() => handleRewriteAndRegenerate(i)}
-                          disabled={isGenerating || generatingOneIndex !== null || rewritingIndex !== null}
+                          disabled={isThisBusy}
                           title="Rewrite prompt to avoid moderation, then generate"
                           className={`flex-1 flex items-center justify-center text-xs py-1 rounded transition disabled:opacity-40 ${
-                            rewritingIndex === i
+                            isThisRewriting
                               ? "bg-amber-800 text-amber-200"
                               : "bg-zinc-800 hover:bg-amber-800 text-zinc-300 hover:text-amber-200"
                           }`}
                         >
-                          {rewritingIndex === i ? <Spinner size="sm" /> : "New prompt"}
+                          {isThisRewriting ? <Spinner size="sm" /> : "New prompt"}
                         </button>
                         <button
                           onClick={() => downloadImage(i)}
@@ -1043,7 +1064,7 @@ function CostBreakdown({ usage, count, batches }: { usage: UsageSummary; count: 
   const costPer100 = count > 0 ? (cost.total / count) * 100 : 0;
   return (
     <div className="bg-zinc-950 rounded-lg border border-zinc-800 p-4 space-y-3">
-      <p className="text-xs font-medium text-zinc-400">Cost breakdown (gpt-5-nano pricing)</p>
+      <p className="text-xs font-medium text-zinc-400">Cost breakdown (o4-mini pricing)</p>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <Stat label="Batches" value={String(batches)} />
         <Stat label="Input tokens" value={usage.prompt_tokens.toLocaleString()} />

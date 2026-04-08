@@ -22,8 +22,7 @@ export async function POST(request: NextRequest) {
 
   if (!prompt) return Response.json({ error: "prompt required" }, { status: 400 });
 
-  // Positive framing only — mentioning prohibited content by name can itself trigger moderation.
-  const safePrompt = `${prompt} Rendered as reverent sacred fine art. Museum-quality Renaissance painting style. Fully clothed figures. Dignified and formal composition.`;
+  const safePrompt = prompt;
 
   const orAspectRatio = ASPECT_RATIO_MAP[aspectRatio] ?? "1:1";
 
