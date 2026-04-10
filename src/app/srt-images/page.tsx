@@ -612,7 +612,7 @@ export default function SrtImagesPage() {
                 Session restored
               </span>
             )}
-            {step !== "upload" && (
+            {(step !== "upload" || hasRestoredSession) && (
               <button
                 onClick={handleStartFresh}
                 className="text-xs text-zinc-500 hover:text-zinc-300 transition"
