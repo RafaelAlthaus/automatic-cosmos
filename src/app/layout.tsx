@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Storyblocks Video Scraper",
-  description: "Scrape and download videos from Storyblocks search results",
+  title: "Content Creator Assistant",
+  description: "AI-powered tools for video content creators",
 };
 
 export default function RootLayout({
