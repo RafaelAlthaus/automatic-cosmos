@@ -159,6 +159,11 @@ const STYLE_PRESETS: { key: string; label: string; style: string }[] = [
     label: "Doctors Office",
     style: "Photorealistic medical documentary style. Clean, modern environments with soft, diffused lighting. The color palette is very diverse and colorful. The overall composition is clear, professional, and reassuring — suitable for broadcast health education content.",
   },
+  {
+    key: "family-guy",
+    label: "Family Guy",
+    style: "American adult animated sitcom style, directly inspired by Family Guy and American Dad, but DO NOT actually include any characters from those shows. Clean 2D vector art with thick black outlines on every element — characters, objects, backgrounds. Flat solid colors with no gradients, no realistic shading, no 3D rendering. Characters have oversized heads, simple oval eyes with small black dot pupils, simplified four-finger hands, and exaggerated facial expressions that communicate emotion instantly. Clothing is flat color blocks with no wrinkles or texture. Backgrounds are clean and minimal — white or simple environments with just enough detail to establish the setting. Objects important to the narrative (credit cards, money, phones, bills, cars) are drawn slightly larger than realistic scale and highlighted with colored glow effects — green glow for positive financial moves, red glow for negative decisions or danger. Floating icons and thought bubbles above characters' heads represent abstract concepts like debt, stress, or goals. The overall feeling is bold, readable, slightly humorous, and non-intimidating. No 3D, no anime, no painterly effects. Pure Western adult animation, simple and clean.",
+  },
 ];
 
 const BATCH_SIZE = 20;
@@ -978,7 +983,15 @@ export default function SrtImagesPage() {
                     {/* Footer */}
                     <div className="flex flex-col gap-1">
                       <div className="flex items-center justify-between">
-                        <span className="text-xs font-mono text-zinc-500">{num}.jpg</span>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-xs font-mono text-zinc-500">{num}.jpg</span>
+                          <div className="relative group/seg">
+                            <button className="text-zinc-600 hover:text-zinc-400 text-xs leading-none transition" aria-label="View segment text">☰</button>
+                            <div className="absolute bottom-full left-0 mb-2 w-60 bg-zinc-800 border border-zinc-700 text-xs text-zinc-300 rounded-lg p-2.5 hidden group-hover/seg:block z-20 leading-relaxed shadow-xl">
+                              {d.segment}
+                            </div>
+                          </div>
+                        </div>
                         {imageUrl && (
                           <button
                             onClick={() => handleGenerateOne(i)}
