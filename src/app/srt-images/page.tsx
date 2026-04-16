@@ -51,22 +51,38 @@ function parseSrt(content: string): SrtEntry[] {
 // ─── Segment grouper ──────────────────────────────────────────────────────────
 
 function groupIntoSegments(entries: SrtEntry[], targetSeconds: number): Segment[] {
-  const segments: Segment[] = [];
-  let i = 0;
-  while (i < entries.length) {
-    const segStart = entries[i].start;
-    let segEnd = entries[i].end;
-    const texts = [entries[i].text];
-    let j = i + 1;
-    while (j < entries.length && segEnd - segStart < targetSeconds) {
-      segEnd = entries[j].end;
-      texts.push(entries[j].text);
-      j++;
-    }
-    segments.push({ startTime: segStart, endTime: segEnd, text: texts.join(" ") });
-    i = j;
+  if (entries.length === 0) return [];
+  const totalDuration = entries[entries.length - 1].end;
+  const numBuckets = Math.ceil(totalDuration / targetSeconds);
+  const bucketSize = totalDuration / numBuckets;
+  const buckets: SrtEntry[][] = Array.from({ length: numBuckets }, () => []);
+  for (const entry of entries) {
+    const midpoint = (entry.start + entry.end) / 2;
+    const bi = Math.min(Math.floor(midpoint / bucketSize), numBuckets - 1);
+    buckets[bi].push(entry);
   }
-  return segments;
+  return buckets
+    .map((bucket, i) => ({
+      startTime: i * bucketSize,
+      endTime: (i + 1) * bucketSize,
+      text: bucket.map((e) => e.text).join(" "),
+    }))
+    .filter((seg) => seg.text.trim().length > 0);
+}
+
+// ─── Context window helper ────────────────────────────────────────────────────
+
+const CONTEXT_WINDOW = 2; // segments before and after each focal segment
+
+function buildWindowedBatchItem(segs: string[], index: number): string {
+  const before = segs.slice(Math.max(0, index - CONTEXT_WINDOW), index);
+  const focus = segs[index];
+  const after = segs.slice(index + 1, Math.min(segs.length, index + 1 + CONTEXT_WINDOW));
+  const parts: string[] = [];
+  if (before.length > 0) parts.push(`[CONTEXT — preceding]:\n${before.join(" ")}`);
+  parts.push(`[FOCUS — generate image for this]:\n${focus}`);
+  if (after.length > 0) parts.push(`[CONTEXT — following]:\n${after.join(" ")}`);
+  return parts.join("\n\n");
 }
 
 // ─── Cost helpers ─────────────────────────────────────────────────────────────
@@ -162,7 +178,7 @@ const STYLE_PRESETS: { key: string; label: string; style: string }[] = [
   {
     key: "family-guy",
     label: "Family Guy",
-    style: "American adult animated sitcom style, directly inspired by Family Guy and American Dad, but DO NOT actually include any characters from those shows. Clean 2D vector art with thick black outlines on every element — characters, objects, backgrounds. Flat solid colors with no gradients, no realistic shading, no 3D rendering. Characters have oversized heads, simple oval eyes with small black dot pupils, simplified four-finger hands, and exaggerated facial expressions that communicate emotion instantly. Clothing is flat color blocks with no wrinkles or texture. Backgrounds are clean and minimal — white or simple environments with just enough detail to establish the setting. Objects important to the narrative (credit cards, money, phones, bills, cars) are drawn slightly larger than realistic scale and highlighted with colored glow effects — green glow for positive financial moves, red glow for negative decisions or danger. Floating icons and thought bubbles above characters' heads represent abstract concepts like debt, stress, or goals. The overall feeling is bold, readable, slightly humorous, and non-intimidating. No 3D, no anime, no painterly effects. Pure Western adult animation, simple and clean.",
+    style: "American adult animated sitcom style, directly inspired by the character style and visuals of Family Guy and American Dad. Clean 2D vector art with thick black outlines on every element — characters, objects, backgrounds. Flat solid colors with no gradients, no realistic shading, no 3D rendering. Characters have exaggerated facial expressions that communicate emotion instantly. Clothing is flat color blocks with no wrinkles or texture. Backgrounds are clean and minimal, with just enough detail to establish the setting. Objects important to the narrative (credit cards, money, phones, bills, cars) are drawn slightly larger than realistic scale. Floating icons and thought bubbles above characters' heads represent abstract concepts like debt, stress, or goals. The overall feeling is bold, readable, slightly humorous. No 3D, no anime, no painterly effects. Pure Western adult animation, simple and clean.",
   },
 ];
 
@@ -341,11 +357,12 @@ export default function SrtImagesPage() {
     setLogs([]);
 
     const segsToDescribe = segments.map((_, i) => editableSegments[i] ?? segments[i].text);
+    const windowedSegs = segsToDescribe.map((_, i) => buildWindowedBatchItem(segsToDescribe, i));
     const systemPrompt = `${videoContext}\n\nImage style: ${imageStyle}`;
 
     const batches: string[][] = [];
-    for (let i = 0; i < segsToDescribe.length; i += BATCH_SIZE) {
-      batches.push(segsToDescribe.slice(i, i + BATCH_SIZE));
+    for (let i = 0; i < windowedSegs.length; i += BATCH_SIZE) {
+      batches.push(windowedSegs.slice(i, i + BATCH_SIZE));
     }
 
     const totalBatches = batches.length;
@@ -411,14 +428,15 @@ export default function SrtImagesPage() {
   const handleRegenerateDescription = useCallback(async (index: number) => {
     setRegeneratingIndex(index);
     const systemPrompt = `${videoContext}\n\nImage style: ${imageStyle}`;
-    const segment = descriptions[index].segment;
+    const allSegs = descriptions.map((d) => d.segment);
+    const windowedSeg = buildWindowedBatchItem(allSegs, index);
     try {
       const res = await fetch("/api/generate-descriptions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "describe-batch",
-          batch: [segment],
+          batch: [windowedSeg],
           batchIndex: 0,
           imageStyle: systemPrompt,
           cast: videoCast,
@@ -530,13 +548,15 @@ export default function SrtImagesPage() {
     const num = String(index + 1).padStart(3, "0");
     addImageLog(`Image ${num} — regenerating description…`);
     const systemPrompt = `${videoContext}\n\nImage style: ${imageStyle}`;
+    const allSegsForRewrite = descriptions.map((d) => d.segment);
+    const windowedSegForRewrite = buildWindowedBatchItem(allSegsForRewrite, index);
     try {
       const res = await fetch("/api/generate-descriptions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "describe-batch",
-          batch: [descriptions[index].segment],
+          batch: [windowedSegForRewrite],
           batchIndex: 0,
           imageStyle: systemPrompt,
           cast: videoCast,

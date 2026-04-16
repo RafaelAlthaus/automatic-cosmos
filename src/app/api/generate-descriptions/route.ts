@@ -13,6 +13,12 @@ ${context}${cast ? `\n\nPersistent characters and setting — the primary subjec
 ABSOLUTE RULES — apply to every image regardless of context:
 - Never include a host, narrator, or presenter character. No one speaks to camera.
 
+Some batch items may be wrapped in context markers:
+  [CONTEXT — preceding]: text from earlier segments
+  [FOCUS — generate image for this]: the exact moment this image must depict
+  [CONTEXT — following]: text from later segments
+When these markers are present, generate a description that depicts ONLY the FOCUS moment. Use the CONTEXT sections to understand narrative flow and avoid generic scenes — but never depict the context segments themselves in the image.
+
 CRITICAL — Depict what is LITERALLY described in each caption, not the video's general theme:
 - Read each caption as an isolated moment. Ask: what specific action, emotion, or event is happening RIGHT NOW?
 - The character's body language, expression, and what they are doing must match the caption exactly.
