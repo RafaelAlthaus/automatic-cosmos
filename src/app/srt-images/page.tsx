@@ -51,22 +51,38 @@ function parseSrt(content: string): SrtEntry[] {
 // ─── Segment grouper ──────────────────────────────────────────────────────────
 
 function groupIntoSegments(entries: SrtEntry[], targetSeconds: number): Segment[] {
-  const segments: Segment[] = [];
-  let i = 0;
-  while (i < entries.length) {
-    const segStart = entries[i].start;
-    let segEnd = entries[i].end;
-    const texts = [entries[i].text];
-    let j = i + 1;
-    while (j < entries.length && segEnd - segStart < targetSeconds) {
-      segEnd = entries[j].end;
-      texts.push(entries[j].text);
-      j++;
-    }
-    segments.push({ startTime: segStart, endTime: segEnd, text: texts.join(" ") });
-    i = j;
+  if (entries.length === 0) return [];
+  const totalDuration = entries[entries.length - 1].end;
+  const numBuckets = Math.ceil(totalDuration / targetSeconds);
+  const bucketSize = totalDuration / numBuckets;
+  const buckets: SrtEntry[][] = Array.from({ length: numBuckets }, () => []);
+  for (const entry of entries) {
+    const midpoint = (entry.start + entry.end) / 2;
+    const bi = Math.min(Math.floor(midpoint / bucketSize), numBuckets - 1);
+    buckets[bi].push(entry);
   }
-  return segments;
+  return buckets
+    .map((bucket, i) => ({
+      startTime: i * bucketSize,
+      endTime: (i + 1) * bucketSize,
+      text: bucket.map((e) => e.text).join(" "),
+    }))
+    .filter((seg) => seg.text.trim().length > 0);
+}
+
+// ─── Context window helper ────────────────────────────────────────────────────
+
+const CONTEXT_WINDOW = 2; // segments before and after each focal segment
+
+function buildWindowedBatchItem(segs: string[], index: number): string {
+  const before = segs.slice(Math.max(0, index - CONTEXT_WINDOW), index);
+  const focus = segs[index];
+  const after = segs.slice(index + 1, Math.min(segs.length, index + 1 + CONTEXT_WINDOW));
+  const parts: string[] = [];
+  if (before.length > 0) parts.push(`[CONTEXT — preceding]:\n${before.join(" ")}`);
+  parts.push(`[FOCUS — generate image for this]:\n${focus}`);
+  if (after.length > 0) parts.push(`[CONTEXT — following]:\n${after.join(" ")}`);
+  return parts.join("\n\n");
 }
 
 // ─── Cost helpers ─────────────────────────────────────────────────────────────
@@ -159,6 +175,16 @@ const STYLE_PRESETS: { key: string; label: string; style: string }[] = [
     label: "Doctors Office",
     style: "Photorealistic medical documentary style. Clean, modern environments with soft, diffused lighting. The color palette is very diverse and colorful. The overall composition is clear, professional, and reassuring — suitable for broadcast health education content.",
   },
+  {
+    key: "family-guy",
+    label: "Family Guy",
+    style: "American adult animated sitcom style, directly inspired by the character style and visuals of Family Guy and American Dad. Clean 2D vector art with thick black outlines on every element — characters, objects, backgrounds. Flat solid colors with no gradients, no realistic shading, no 3D rendering. Characters have exaggerated facial expressions that communicate emotion instantly. Clothing is flat color blocks with no wrinkles or texture. Backgrounds are clean and minimal, with just enough detail to establish the setting. Objects important to the narrative (credit cards, money, phones, bills, cars) are drawn slightly larger than realistic scale. Floating icons and thought bubbles above characters' heads represent abstract concepts like debt, stress, or goals. The overall feeling is bold, readable, slightly humorous. No 3D, no anime, no painterly effects. Pure Western adult animation, simple and clean.",
+  },
+  {
+	key: "disney",
+	label: "Disney",
+	style: "Warm 3D stylized cartoon in the style of modern animated shorts — think Pixar SparkShorts, Coco, or Disney+ animated shorts. Characters are Latino/Mexican with clearly Hispanic features: warm skin tones, dark hair, expressive brown eyes. Soft rounded shapes, friendly proportions, slightly stylized but realistic enough to feel relatable. Soft studio lighting with gentle shadows. Rich saturated colors with warm golden tones. Expressive faces that communicate emotion clearly. Clean modern settings (apartment kitchens, small offices, car dealerships) with just enough detail to establish context. Financial objects (credit cards, cash, phones, bills) rendered with slight emphasis to draw the eye. Overall feeling: warm, trustworthy, aspirational, like a financial advisor who's also family."
+  }
 ];
 
 const BATCH_SIZE = 20;
@@ -336,11 +362,12 @@ export default function SrtImagesPage() {
     setLogs([]);
 
     const segsToDescribe = segments.map((_, i) => editableSegments[i] ?? segments[i].text);
+    const windowedSegs = segsToDescribe.map((_, i) => buildWindowedBatchItem(segsToDescribe, i));
     const systemPrompt = `${videoContext}\n\nImage style: ${imageStyle}`;
 
     const batches: string[][] = [];
-    for (let i = 0; i < segsToDescribe.length; i += BATCH_SIZE) {
-      batches.push(segsToDescribe.slice(i, i + BATCH_SIZE));
+    for (let i = 0; i < windowedSegs.length; i += BATCH_SIZE) {
+      batches.push(windowedSegs.slice(i, i + BATCH_SIZE));
     }
 
     const totalBatches = batches.length;
@@ -406,14 +433,15 @@ export default function SrtImagesPage() {
   const handleRegenerateDescription = useCallback(async (index: number) => {
     setRegeneratingIndex(index);
     const systemPrompt = `${videoContext}\n\nImage style: ${imageStyle}`;
-    const segment = descriptions[index].segment;
+    const allSegs = descriptions.map((d) => d.segment);
+    const windowedSeg = buildWindowedBatchItem(allSegs, index);
     try {
       const res = await fetch("/api/generate-descriptions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "describe-batch",
-          batch: [segment],
+          batch: [windowedSeg],
           batchIndex: 0,
           imageStyle: systemPrompt,
           cast: videoCast,
@@ -525,13 +553,15 @@ export default function SrtImagesPage() {
     const num = String(index + 1).padStart(3, "0");
     addImageLog(`Image ${num} — regenerating description…`);
     const systemPrompt = `${videoContext}\n\nImage style: ${imageStyle}`;
+    const allSegsForRewrite = descriptions.map((d) => d.segment);
+    const windowedSegForRewrite = buildWindowedBatchItem(allSegsForRewrite, index);
     try {
       const res = await fetch("/api/generate-descriptions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "describe-batch",
-          batch: [descriptions[index].segment],
+          batch: [windowedSegForRewrite],
           batchIndex: 0,
           imageStyle: systemPrompt,
           cast: videoCast,
@@ -978,7 +1008,15 @@ export default function SrtImagesPage() {
                     {/* Footer */}
                     <div className="flex flex-col gap-1">
                       <div className="flex items-center justify-between">
-                        <span className="text-xs font-mono text-zinc-500">{num}.jpg</span>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-xs font-mono text-zinc-500">{num}.jpg</span>
+                          <div className="relative group/seg">
+                            <button className="text-zinc-600 hover:text-zinc-400 text-xs leading-none transition" aria-label="View segment text">☰</button>
+                            <div className="absolute bottom-full left-0 mb-2 w-60 bg-zinc-800 border border-zinc-700 text-xs text-zinc-300 rounded-lg p-2.5 hidden group-hover/seg:block z-20 leading-relaxed shadow-xl">
+                              {d.segment}
+                            </div>
+                          </div>
+                        </div>
                         {imageUrl && (
                           <button
                             onClick={() => handleGenerateOne(i)}
