@@ -180,6 +180,11 @@ const STYLE_PRESETS: { key: string; label: string; style: string }[] = [
     label: "Family Guy",
     style: "American adult animated sitcom style, directly inspired by the character style and visuals of Family Guy and American Dad. Clean 2D vector art with thick black outlines on every element — characters, objects, backgrounds. Flat solid colors with no gradients, no realistic shading, no 3D rendering. Characters have exaggerated facial expressions that communicate emotion instantly. Clothing is flat color blocks with no wrinkles or texture. Backgrounds are clean and minimal, with just enough detail to establish the setting. Objects important to the narrative (credit cards, money, phones, bills, cars) are drawn slightly larger than realistic scale. Floating icons and thought bubbles above characters' heads represent abstract concepts like debt, stress, or goals. The overall feeling is bold, readable, slightly humorous. No 3D, no anime, no painterly effects. Pure Western adult animation, simple and clean.",
   },
+  {
+	key: "disney",
+	label: "Disney",
+	style: "Warm 3D stylized cartoon in the style of modern animated shorts — think Pixar SparkShorts, Coco, or Disney+ animated shorts. Characters are Latino/Mexican with clearly Hispanic features: warm skin tones, dark hair, expressive brown eyes. Soft rounded shapes, friendly proportions, slightly stylized but realistic enough to feel relatable. Soft studio lighting with gentle shadows. Rich saturated colors with warm golden tones. Expressive faces that communicate emotion clearly. Clean modern settings (apartment kitchens, small offices, car dealerships) with just enough detail to establish context. Financial objects (credit cards, cash, phones, bills) rendered with slight emphasis to draw the eye. Overall feeling: warm, trustworthy, aspirational, like a financial advisor who's also family."
+  }
 ];
 
 const BATCH_SIZE = 20;
